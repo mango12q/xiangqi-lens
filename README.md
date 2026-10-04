@@ -176,6 +176,8 @@ XiangQiLens/
 | `test_arrow.py` | 走法箭头坐标验证 + 渲染预览 |
 | `stress_test.py` | 连续多帧稳定性与内存压力测试 |
 | `probe_windows.py` | 窗口枚举与后台截图能力探测 |
+| `verify_repo.py` | 发布自检：检查远程仓库信息、README 图片可访问性、关键文件可达性 |
+| `make_shot.py` / `compress_docs.py` | 合成与压缩 README 展示图 |
 | `analyze_board.py` / `detect_lines.py` / ... | 自研路线的调参与诊断工具 |
 
 ---
