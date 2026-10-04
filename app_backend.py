@@ -21,6 +21,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# 版本号：同时用于窗口标题、运行日志与打包产物命名，
+# 便于用户确认自己用的是哪一版。
+__version__ = "0.2.0"
+
 HERE = Path(__file__).resolve().parent
 
 

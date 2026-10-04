@@ -43,8 +43,8 @@
 
 ### 方式 A：下载预编译版（推荐，无需 Python）
 
-从 [Releases](https://github.com/mango12q/xiangqi-lens/releases) 下载 `XiangQiLens-v0.1.0.zip`，
-解压后双击 **`XiangQiLens.exe`**。
+从 [Releases](https://github.com/mango12q/xiangqi-lens/releases/latest) 下载最新版的
+`XiangQiLens-vX.Y.Z.zip`，解压后双击 **`XiangQiLens.exe`**。
 
 > ⚠️ 请**解压后整目录使用**，不要只把 exe 单独拷出来 ——
 > exe 需要同级的 `xq_research/` 提供识别模型与引擎（约 95MB）。
@@ -108,7 +108,7 @@ python tools/setup_engine.py
    不要选整个聊天/宿主窗口 —— 棋盘占比太小会导致角点定位失败
 3. **设置「我方执子」** —— 见下方说明，这一项**选错会让所有建议失效**
 4. 设置「先手」（当前轮到谁走）
-5. 点「开始」```
+5. 点「开始」
 
 #### 「我方执子」与「先手」是两回事
 
