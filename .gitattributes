@@ -1,0 +1,20 @@
+# 统一换行符处理：仓库内一律 LF，检出到 Windows 时转 CRLF
+* text=auto eol=lf
+
+# 明确按二进制处理
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.onnx binary
+*.nnue binary
+*.7z binary
+*.zip binary
+
+# Windows 批处理与 VBS 需要 CRLF
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf
+
+# 避免 git 在 diff 中把这些识别为文本
+*.json linguist-language=JSON
