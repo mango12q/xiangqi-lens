@@ -28,7 +28,7 @@ except OSError:
 
 sys.path.insert(0, str(HERE))
 
-from app_backend import (HERE as BACKEND_DIR, ScreenSource,
+from app_backend import (HERE as BACKEND_DIR, ScreenSource, __version__,
                          check_board_geometry, check_position, create_engine,
                          create_vision, enable_dpi_awareness, fen_with_side,
                          format_score, format_winrate, list_windows_any,
@@ -75,6 +75,33 @@ class Worker(QObject):
         self._published = ""
         self._tracker = None
         self._last_fen = ""
+        self._log_path, self._log_fh = self._open_log()
+
+    @staticmethod
+    def _open_log():
+        """打开运行日志，写在应用根目录旁边。
+
+        打包后没有控制台，出问题时全靠这个日志定位；源码运行也一并写，
+        便于对照。写入失败不影响主流程。
+        """
+        try:
+            base = Path(_sys.executable).resolve().parent if getattr(_sys, "frozen", False) else HERE
+            p = base / "XiangQiLens.log"
+            fh = open(p, "w", encoding="utf-8", buffering=1)
+            fh.write(f"XiangQiLens 运行日志  {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            fh.write(f"版本: v{__version__}\n")
+            fh.write(f"模式: {'打包 exe' if getattr(_sys, 'frozen', False) else '源码'}\n")
+            fh.write("=" * 60 + "\n")
+            return p, fh
+        except Exception:
+            return None, None
+
+    def _log(self, msg: str) -> None:
+        if self._log_fh is not None:
+            try:
+                self._log_fh.write(f"{time.strftime('%H:%M:%S')}  {msg}\n")
+            except Exception:
+                pass
 
     @staticmethod
     def flip_rows(rows: list[str]) -> list[str]:
@@ -111,19 +138,43 @@ class Worker(QObject):
     @Slot()
     def run(self) -> None:
         self._run = True
+
+        # 初始化分步反馈：模型加载 + 首次预热 + 引擎启动合计可能 20~40 秒
+        # （DirectML 首次要编译着色器），期间界面是全黑的，必须给出提示，
+        # 否则用户会以为程序卡死而关掉它。
+        self.status.emit("① 加载识别模型…（首次约 10~30 秒，请稍候）")
         try:
-            self.status.emit("加载识别模型…")
             self._vision = create_vision(cuda=True)
-            self.status.emit("启动引擎…")
+        except Exception as exc:
+            self.error.emit(f"识别模型加载失败: {exc}")
+            self.done.emit()
+            return
+
+        # 主动预热：第一次推理会编译 DirectML 着色器，耗时明显长于后续。
+        # 放在这里做掉，进入主循环后每一帧的耗时才是真实水平。
+        self.status.emit("② 预热识别模型…（首次推理较慢，属正常）")
+        try:
+            import numpy as _np
+            dummy = _np.zeros((256, 256, 3), dtype=_np.uint8)
+            t0 = time.perf_counter()
+            self._vision.infer(dummy)
+            self.status.emit(f"   预热完成，用时 {time.perf_counter() - t0:.1f}s")
+        except Exception as exc:
+            # 预热失败不算致命（可能这张假图触发异常），继续走主流程
+            self.status.emit(f"   预热跳过：{str(exc)[:60]}")
+
+        self.status.emit("③ 启动 Pikafish 引擎…")
+        try:
             self._engine = create_engine(self.threads, self.hash_mb)
         except Exception as exc:
-            self.error.emit(f"初始化失败: {exc}")
+            self.error.emit(f"引擎启动失败: {exc}")
             self.done.emit()
             return
 
         from app_backend import BoardTracker
         # BoardTracker 同时负责「演化校验」和「轮次管理」
         self._tracker = BoardTracker(force_after=6, first_side=self.first_side)
+        self._log("初始化完成，进入识别循环")
 
         self.status.emit("就绪，开始识别…")
         _last_state_note = ""
@@ -137,6 +188,7 @@ class Worker(QObject):
                 if not win_ok:
                     if note != _last_state_note:
                         self.status.emit(note)
+                        self._log(f"窗口状态异常: {note}")
                         _last_state_note = note
                     time.sleep(1.0)
                     continue
@@ -145,6 +197,7 @@ class Worker(QObject):
             bgr = self.source.grab()
             if bgr is None:
                 self.status.emit("抓帧失败（窗口已关闭？）")
+                self._log("抓帧失败")
                 time.sleep(0.5)
                 continue
 
@@ -152,6 +205,7 @@ class Worker(QObject):
                 res = self._vision.infer(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
             except Exception as exc:
                 self.status.emit(f"识别异常: {exc}")
+                self._log(f"识别异常: {exc}")
                 time.sleep(0.3)
                 continue
 
@@ -169,6 +223,7 @@ class Worker(QObject):
                 res["keypoints"], img_shape=bgr.shape)
             if not geo_ok:
                 self.status.emit(f"未定位到棋盘：{geo_why}（请确认对局界面已打开）")
+                self._log(f"几何校验失败: {geo_why}")
                 time.sleep(0.5)
                 continue
 
@@ -191,6 +246,7 @@ class Worker(QObject):
                     self.status.emit(
                         f"局面变化无法解释，已挡下（{self._tracker.stats}）"
                         f" · minConf={res['conf'].min():.2f}")
+                    self._log(f"演化校验挡下: {move}  minConf={res['conf'].min():.2f}")
                 time.sleep(0.10)
                 continue
 
@@ -209,6 +265,7 @@ class Worker(QObject):
             pos_ok, pos_why = check_position(fen)
             if not pos_ok:
                 self.status.emit(f"局面不合法已跳过：{pos_why}")
+                self._log(f"局面校验失败: {pos_why}  FEN={fen}")
                 time.sleep(0.25)
                 continue
             ok, err, n_moves = validate_fen(fen)
@@ -219,6 +276,7 @@ class Worker(QObject):
 
             self._published = key
             t_recog = (time.perf_counter() - t0) * 1000
+            self._log(f"采纳局面({reason}) {fen}  识别 {t_recog:.0f}ms")
             self.status.emit(move_note or "引擎分析中…")
             try:
                 r = self._engine.analyse(fen, movetime_ms=self.movetime)
@@ -226,6 +284,7 @@ class Worker(QObject):
                 # 引擎可能已经崩溃退出（非法局面 / 资源问题），重建它，
                 # 否则后续每一帧都会在同一个死进程上重复失败。
                 self.error.emit(f"引擎异常，正在重启: {exc}")
+                self._log(f"引擎异常: {exc}")
                 try:
                     self._engine.quit()
                 except Exception:
@@ -302,6 +361,13 @@ class Worker(QObject):
             except Exception:
                 pass
             self._engine = None
+        if self._log_fh is not None:
+            try:
+                self._log("已停止")
+                self._log_fh.close()
+            except Exception:
+                pass
+            self._log_fh = None
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +527,7 @@ class BoardView(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("XiangQiLens · 象棋识别分析")
+        self.setWindowTitle(f"XiangQiLens v{__version__} · 象棋识别分析")
         self.resize(1200, 800)
         self.source = ScreenSource()
         self.worker: Worker | None = None

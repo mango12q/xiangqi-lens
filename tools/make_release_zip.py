@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import re
 import sys
 import time
 import zipfile
@@ -13,8 +14,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "dist" / "XiangQiLens"
-OUT = ROOT / "dist" / "XiangQiLens-v0.1.0.zip"
 ARCNAME = "XiangQiLens"
+
+
+def read_version() -> str:
+    """从 app_backend.py 读版本号，避免打包脚本里手写导致不一致。"""
+    txt = (ROOT / "app_backend.py").read_text(encoding="utf-8")
+    m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', txt, re.M)
+    if not m:
+        print("[警告] app_backend.py 里找不到 __version__，回退为 0.0.0")
+        return "0.0.0"
+    return m.group(1)
+
+
+OUT = ROOT / "dist" / f"XiangQiLens-v{read_version()}.zip"
 
 
 def human(n: float) -> str:
@@ -28,6 +41,7 @@ def main() -> int:
 
     files = [p for p in SRC.rglob("*") if p.is_file()]
     total = sum(p.stat().st_size for p in files)
+    print(f"版本号: v{read_version()}")
     print(f"源目录: {SRC}")
     print(f"文件数: {len(files)}   总大小: {human(total)}")
     print(f"输出  : {OUT}")
