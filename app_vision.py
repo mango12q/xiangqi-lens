@@ -15,12 +15,14 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 
-# 切到脚本所在目录：模型与引擎用的是相对路径，从桌面快捷方式启动时
-# 当前目录可能是任意位置，不切换会找不到资源。
-# 放在 import 之前，保证后续所有相对路径解析都基于脚本目录。
+# 切到「应用根目录」：模型与引擎用相对路径查找，从桌面快捷方式或
+# 打包后的 exe 启动时，当前目录可能是任意位置，不切换会找不到资源。
+# app_backend.app_base() 会区分源码运行（脚本目录）与打包运行（exe 目录）。
 import os as _os
+import sys as _sys
 try:
-    _os.chdir(HERE)
+    _base = Path(_sys.executable).resolve().parent if getattr(_sys, "frozen", False) else HERE
+    _os.chdir(_base)
 except OSError:
     pass
 
