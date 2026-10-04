@@ -212,13 +212,156 @@ def create_vision(cuda: bool = True):
     return XiangqiVision(str(POSE_ONNX), str(CLS_ONNX), prefer_cuda=cuda)
 
 
+def window_state(hwnd: int) -> tuple[bool, bool, str]:
+    """查询窗口状态，返回 ``(是否有效, 是否最小化, 提示)``。
+
+    为什么要单独判最小化：窗口最小化时 ``GetWindowRect`` 只返回标题栏尺寸
+    （实测 JJ象棋 变成 237x39），``PrintWindow`` 也拿不到棋盘内容，于是
+    识别结果全是垃圾。这类失败如果只报"局面不合法"，用户根本不知道为什么，
+    因此要明确区分出来。
+    """
+    try:
+        import win32gui
+        if not win32gui.IsWindow(hwnd):
+            return False, False, "窗口已关闭"
+        if win32gui.IsIconic(hwnd):
+            return False, True, "目标窗口已最小化，请先还原窗口"
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        if (r - l) < 200 or (b - t) < 200:
+            return False, False, f"窗口尺寸过小（{r - l}x{b - t}），无法识别棋盘"
+        return True, False, ""
+    except Exception as exc:
+        return False, False, f"窗口状态检查失败: {exc}"
+
+
+def list_windows_any(min_size: int = 200):
+    """枚举所有带标题的顶层窗口（**包含最小化的**）。
+
+    与 ``ScreenSource.list_windows`` 的区别：后者只返回可见窗口，
+    用户把对局窗口最小化后就找不到了。
+    """
+    import win32gui
+
+    out = []
+
+    def cb(hwnd, _):
+        title = win32gui.GetWindowText(hwnd)
+        if not title:
+            return True
+        try:
+            iconic = win32gui.IsIconic(hwnd)
+            # 最小化时 GetWindowRect 不准，用 placement 的还原矩形
+            if iconic:
+                plc = win32gui.GetWindowPlacement(hwnd)
+                l, t, r, b = plc[4]
+            else:
+                l, t, r, b = win32gui.GetWindowRect(hwnd)
+            if (r - l) >= min_size and (b - t) >= min_size:
+                out.append({
+                    "hwnd": hwnd,
+                    "title": title,
+                    "class": win32gui.GetClassName(hwnd),
+                    "rect": (l, t, r, b),
+                    "minimized": bool(iconic),
+                })
+        except Exception:
+            pass
+        return True
+
+    win32gui.EnumWindows(cb, None)
+    out.sort(key=lambda x: -(x["rect"][2] - x["rect"][0]) * (x["rect"][3] - x["rect"][1]))
+    return out
+
+
 def create_engine(threads: int = 8, hash_mb: int = 256):
     from engine_client import UciEngine
     eng = UciEngine(str(ENGINE_EXE), name="pikafish")
     eng.set_option("Threads", threads)
     eng.set_option("Hash", hash_mb)
+    # 让引擎在 info 行里带上 wdl（胜/和/负概率），用于显示人类可读的胜率。
+    # 实测支持：开启后 info 行会多出 " wdl 72 917 11" 这样的字段。
+    try:
+        eng.set_option("UCI_ShowWDL", True)
+    except Exception:
+        pass
     eng.isready()
     return eng
+
+
+def parse_wdl(line: str) -> tuple[int, int, int] | None:
+    """从一行 info 里解析 wdl（胜/和/负，千分比，红方视角）。"""
+    if " wdl " not in line:
+        return None
+    try:
+        seg = line.split(" wdl ", 1)[1].split()
+        w, d, l = int(seg[0]), int(seg[1]), int(seg[2])
+        return w, d, l
+    except Exception:
+        return None
+
+
+def winrate_from_cp(cp: int | None) -> float | None:
+    """没有 wdl 时，用经验公式把 centipawn 换算成**红方**胜率（0~100）。
+
+    采用 tanh 形状的经验映射：
+
+        red% = 50 + 50 * tanh(cp / K)      K = 470
+
+    选择理由：
+    * **cp = 0 恰好给出 50%**（避免了早期版本用指数式归一化时的偏差）
+    * 单调、平滑，大分差自然饱和到 0% / 100%
+    * K 取值使 100cp ≈ 60%、300cp ≈ 79%、1000cp ≈ 97%，量级与
+      Stockfish/Pikafish 公布的胜率曲线接近
+
+    仅在引擎未输出 wdl 时作为兜底显示。
+    """
+    if cp is None:
+        return None
+    import math
+    try:
+        K = 470.0
+        red = 50.0 + 50.0 * math.tanh(float(cp) / K)
+        return max(0.0, min(100.0, red))
+    except Exception:
+        return None
+
+
+def format_winrate(wdl: tuple[int, int, int] | None, cp: int | None,
+                   my_side: str = "w") -> str:
+    """把 wdl 或 cp 转成一句人类可读的局面评估。
+
+    ``wdl`` 是引擎给的（红方视角，千分比）。这里按「我方」视角换算，
+    这样执黑时看到的是自己的胜率而不是红方的。
+    """
+    if wdl is not None:
+        w, d, l = wdl
+        total = max(1, w + d + l)
+        red = w * 100.0 / total          # 红方胜率
+        draw = d * 100.0 / total
+        mine = red if my_side == "w" else (l * 100.0 / total)
+        theirs = (l * 100.0 / total) if my_side == "w" else red
+        if draw >= 55:
+            shape = "和棋倾向"
+        elif abs(mine - theirs) >= 25:
+            shape = "我方大优" if mine > theirs else "我方劣势"
+        elif abs(mine - theirs) >= 10:
+            shape = "我方稍优" if mine > theirs else "我方稍亏"
+        else:
+            shape = "均势"
+        return (f"我方胜率 {mine:.0f}% · 和 {draw:.0f}% · 对方 {theirs:.0f}%  "
+                f"（{shape}）")
+
+    p = winrate_from_cp(cp)
+    if p is None:
+        return "—"
+    mine = p if my_side == "w" else (100.0 - p)
+    if abs(mine - 50) >= 25:
+        shape = "我方大优" if mine > 50 else "我方劣势"
+    elif abs(mine - 50) >= 10:
+        shape = "我方稍优" if mine > 50 else "我方稍亏"
+    else:
+        shape = "均势"
+    return f"我方胜率 {mine:.0f}%（{shape}，估算）"
 
 
 def validate_fen(fen: str) -> tuple[bool, str, int]:

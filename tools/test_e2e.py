@@ -18,7 +18,8 @@ sys.path.insert(0, str(HERE))
 from app_backend import (BoardTracker, ScreenSource, check_board_geometry,
                          check_position, create_engine, create_vision,
                          enable_dpi_awareness, fen_with_side, format_score,
-                         move_to_chinese, parse_alternatives, validate_fen)
+                         format_winrate, move_to_chinese, parse_alternatives,
+                         parse_wdl, validate_fen)
 
 
 def main() -> int:
@@ -104,11 +105,22 @@ def main() -> int:
         best = r.get("bestmove") or ""
         analysed += 1
 
+        # 提取 wdl（胜/和/负）并转成我方视角的胜率
+        wdl = None
+        for line in reversed(r.get("info", [])):
+            wdl = parse_wdl(line)
+            if wdl is not None:
+                break
+        winrate = format_winrate(wdl, r.get("score_cp"), args.side)
+
         print(f"--- 帧{i}: 采信({reason}) {t_rec:.0f}ms")
         print(f"    FEN  : {fen}")
         print(f"    轮次 : {side_cn}方走   合法着法 {n_moves}")
         print(f"    建议 : {best}  {move_to_chinese(fen, best)}   "
               f"分数 {format_score(r.get('score_cp'))}  深度 {r.get('depth')}")
+        print(f"    局势 : {winrate}")
+        if wdl:
+            print(f"    WDL  : 胜 {wdl[0]} / 和 {wdl[1]} / 负 {wdl[2]}  (千分比，红方视角)")
         alts = parse_alternatives(r.get("info", []), fen, limit=3)
         for a in alts:
             print(f"           {a['iccs']} {a['chinese']:8} {a['score']:>8} 深度{a['depth']}")

@@ -29,8 +29,9 @@ sys.path.insert(0, str(HERE))
 from app_backend import (HERE as BACKEND_DIR, ScreenSource,
                          check_board_geometry, check_position, create_engine,
                          create_vision, enable_dpi_awareness, fen_with_side,
-                         format_score, move_arrow, move_to_chinese,
-                         parse_alternatives, selftest, validate_fen)
+                         format_score, format_winrate, list_windows_any,
+                         move_arrow, move_to_chinese, parse_alternatives,
+                         parse_wdl, selftest, validate_fen, window_state)
 
 from PySide6.QtCore import QObject, QRect, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
@@ -59,7 +60,11 @@ class Worker(QObject):
         self.hash_mb = 256
         self.movetime = 1200
         self.confirm = 3
-        self.first_side = "w"          # 首帧轮次：w=红先 / b=黑先
+        # first_side：首帧轮次（红先/黑先），只影响"该谁走"
+        self.first_side = "w"
+        # my_side：我方执子方（红/黑）。执黑时棋盘在屏幕上与标准 FEN 上下颠倒，
+        # 必须翻转矩阵才能得到正确局面 —— 这是与 first_side 完全独立的一维。
+        self.my_side = "w"
         self._run = False
         self._vision = None
         self._engine = None
@@ -68,6 +73,38 @@ class Worker(QObject):
         self._published = ""
         self._tracker = None
         self._last_fen = ""
+
+    @staticmethod
+    def flip_rows(rows: list[str]) -> list[str]:
+        """把识别出的 10x9 矩阵旋转 180°，得到标准朝向（row 0 = 黑方底线）。
+
+        模型训练时假设画面里红方在下方，因此：
+        * 我方执红（红在下）→ 原样使用
+        * 我方执黑（黑在下）→ 画面上下颠倒，需 180° 旋转
+          （上下翻转 + 每行左右翻转；只上下翻会得到镜像的非法国度）
+
+        返回的每一行也一并左右翻转，保证与 FEN 的 a..i 列序一致。
+        """
+        return [row[::-1] for row in reversed(rows)]
+
+    @staticmethod
+    def rows_to_fen(rows: list[str], side_to_move: str) -> str:
+        """把 10x9 短标签矩阵转成 FEN（不依赖 xq_vision，便于翻转后使用）。"""
+        board: list[str] = []
+        for row in rows:
+            s, empty = "", 0
+            for ch in row:
+                if ch in ".x":
+                    empty += 1
+                else:
+                    if empty:
+                        s += str(empty)
+                        empty = 0
+                    s += ch
+            if empty:
+                s += str(empty)
+            board.append(s)
+        return "/".join(board) + f" {side_to_move} - - 0 1"
 
     @Slot()
     def run(self) -> None:
@@ -87,8 +124,22 @@ class Worker(QObject):
         self._tracker = BoardTracker(force_after=6, first_side=self.first_side)
 
         self.status.emit("就绪，开始识别…")
+        _last_state_note = ""
         while self._run:
             t0 = time.perf_counter()
+
+            # 先查窗口状态：最小化时截图拿不到棋盘，必须明确告知用户，
+            # 否则只会表现为"局面不合法"，让人摸不着头脑。
+            if self.source.hwnd:
+                win_ok, minimized, note = window_state(self.source.hwnd)
+                if not win_ok:
+                    if note != _last_state_note:
+                        self.status.emit(note)
+                        _last_state_note = note
+                    time.sleep(1.0)
+                    continue
+                _last_state_note = ""
+
             bgr = self.source.grab()
             if bgr is None:
                 self.status.emit("抓帧失败（窗口已关闭？）")
@@ -102,7 +153,11 @@ class Worker(QObject):
                 time.sleep(0.3)
                 continue
 
+            # 朝向归一：识别模型假设画面里红方在下方（row 0 = 黑方底线）。
+            # 我方执黑时画面是上下颠倒的，必须旋转 180° 才能得到标准 FEN。
             rows = res["rows"]
+            if self.my_side == "b":
+                rows = self.flip_rows(rows)
             key = "".join(rows)
 
             # pose 几何校验：画面里没有棋盘时，模型会输出退化的四边形
@@ -124,7 +179,8 @@ class Worker(QObject):
                 time.sleep(0.10)
                 continue
 
-            fen_base = self._vision.to_fen(rows, side_to_move="w")
+            # 用翻转后的矩阵生成 FEN（此时 row 0 一定是黑方底线）
+            fen_base = self.rows_to_fen(rows, "w")
 
             # 演化校验 + 轮次推进（BoardTracker 内部处理）
             accept, reason, move, side = self._tracker.update(fen_base)
@@ -199,6 +255,14 @@ class Worker(QObject):
             for a in alts:
                 a["arrow"] = move_arrow(res["warp_mat"], a["iccs"])
 
+            # 从引擎 info 行里取 wdl（胜/和/负），转成我方视角的胜率描述
+            wdl = None
+            for line in reversed(r.get("info", [])):
+                wdl = parse_wdl(line)
+                if wdl is not None:
+                    break
+            winrate = format_winrate(wdl, r.get("score_cp"), self.my_side)
+
             diag = {
                 "score": format_score(r.get("score_cp")),
                 "depth": r.get("depth"),
@@ -209,6 +273,9 @@ class Worker(QObject):
                 "moves": n_moves,
                 "side": side,
                 "note": move_note,
+                "flipped": self.my_side == "b",
+                "winrate": winrate,
+                "wdl": wdl,
                 "arrow": move_arrow(res["warp_mat"], best),
                 "alts": alts,
                 "guard": self._tracker.stats,
@@ -258,14 +325,27 @@ class BoardView(QLabel):
         self._rows: list[str] | None = None
         self._arrow: dict | None = None       # 最佳着法箭头
         self._alts: list[dict] = []           # 候选着法（含 arrow）
+        self._flipped = False                 # 我方执黑：坐标需 180° 映射
 
     def update_board(self, warped: np.ndarray, rows: list[str],
-                     arrow: dict | None = None, alts: list[dict] | None = None) -> None:
+                     arrow: dict | None = None, alts: list[dict] | None = None,
+                     flipped: bool = False) -> None:
         self._warped = warped
         self._rows = rows
         self._arrow = arrow
         self._alts = alts or []
+        self._flipped = flipped
         self.update()
+
+    def _map(self, x: float, y: float, w: int, h: int) -> tuple[float, float]:
+        """把我方执黑时的坐标做 180° 映射，使其与显示的画面一致。
+
+        识别出的矩阵在执黑时被翻转了 180°（得到标准 FEN），但画面上棋子的
+        实际位置没变，所以绘制用的坐标要跟着翻转。
+        """
+        if not self._flipped:
+            return x, y
+        return float(w) - float(x), float(h) - float(y)
 
     @staticmethod
     def _draw_arrow(p: QPainter, x1: float, y1: float, x2: float, y2: float,
@@ -341,16 +421,20 @@ class BoardView(QLabel):
                 f, t = ar.get("from"), ar.get("to")
                 if not f or not t:
                     continue
-                self._draw_arrow(p, f[0], f[1], t[0], t[1], scale, ox, oy,
+                fx, fy = self._map(f[0], f[1], w, h)
+                tx, ty = self._map(t[0], t[1], w, h)
+                self._draw_arrow(p, fx, fy, tx, ty, scale, ox, oy,
                                  QColor(90, 170, 255, 110), max(2, base_w - 2), head)
 
             # 最佳着法：先描深色边，再画亮绿主体，保证在任何底色上都看得清
             ar = self._arrow
             if ar and ar.get("from") and ar.get("to"):
                 f, t = ar["from"], ar["to"]
-                self._draw_arrow(p, f[0], f[1], t[0], t[1], scale, ox, oy,
+                fx, fy = self._map(f[0], f[1], w, h)
+                tx, ty = self._map(t[0], t[1], w, h)
+                self._draw_arrow(p, fx, fy, tx, ty, scale, ox, oy,
                                  QColor(0, 0, 0, 170), base_w + 4, head * 1.15)
-                self._draw_arrow(p, f[0], f[1], t[0], t[1], scale, ox, oy,
+                self._draw_arrow(p, fx, fy, tx, ty, scale, ox, oy,
                                  QColor(60, 230, 110), base_w, head)
 
             # ---- 识别不确定的格子 ----
@@ -400,8 +484,14 @@ class MainWindow(QMainWindow):
         self.lbl_best.setStyleSheet(
             "font-family:'Microsoft YaHei'; font-size:25px; "
             "color:#5ee08a; font-weight:600;")
+        # 胜率单独一行、字号大一些 —— 这是最直观的局面判断
+        self.lbl_winrate = QLabel("—")
+        self.lbl_winrate.setStyleSheet(
+            "font-family:'Microsoft YaHei'; font-size:15px; color:#e8dcc8;")
+        self.lbl_winrate.setWordWrap(True)
         self.lbl_best_sub = QLabel("—")
         self.lbl_best_sub.setStyleSheet("color:#98a2b0; font-size:12px;")
+        self.lbl_best_sub.setWordWrap(True)
         # 轮次提示（差分推进 / 引擎校正时显示）
         self.lbl_side_note = QLabel("")
         self.lbl_side_note.setStyleSheet("color:#e8b93c; font-size:12px;")
@@ -410,6 +500,7 @@ class MainWindow(QMainWindow):
         info = QGroupBox("当前建议")
         iv = QVBoxLayout(info)
         iv.addWidget(self.lbl_best)
+        iv.addWidget(self.lbl_winrate)
         iv.addWidget(self.lbl_best_sub)
         iv.addWidget(self.lbl_side_note)
         iv.addSpacing(8)
@@ -461,8 +552,20 @@ class MainWindow(QMainWindow):
         self.combo_side.addItem("红方先行", "w")
         self.combo_side.addItem("黑方先行", "b")
         self.combo_side.setToolTip(
-            "开局轮次。识别看不出轮到谁走，只能先猜；\n"
+            "开局轮次（该谁先走）。识别看不出轮到谁走，只能先猜；\n"
             "若猜错，引擎着法的合法性会在第一次分析后自动纠正。")
+
+        # 我方执子方 —— 与「先手」是完全独立的一维：
+        # 「先手」决定该谁走，「我方执子」决定画面朝向。
+        # 执黑时棋盘在屏幕上与标准 FEN 上下颠倒，必须翻转矩阵，
+        # 否则识别出的局面整个是错的、箭头也会指反。
+        self.combo_my_side = QComboBox()
+        self.combo_my_side.addItem("我方执红", "w")
+        self.combo_my_side.addItem("我方执黑", "b")
+        self.combo_my_side.setToolTip(
+            "你在这局里执哪一方。\n"
+            "执黑时棋盘在画面上是上下颠倒的，程序会翻转矩阵还原成标准局面。\n"
+            "选错的后果：局面整个颠倒，走法建议全部无效。")
 
         self.btn_run = QPushButton("开始")
         self.btn_run.setMinimumWidth(96)
@@ -472,7 +575,10 @@ class MainWindow(QMainWindow):
         top.addWidget(QLabel("目标窗口"))
         top.addWidget(self.combo, 1)
         top.addWidget(btn_refresh)
-        top.addSpacing(14)
+        top.addSpacing(10)
+        top.addWidget(QLabel("我方执子"))
+        top.addWidget(self.combo_my_side)
+        top.addSpacing(6)
         top.addWidget(QLabel("先手"))
         top.addWidget(self.combo_side)
         top.addWidget(QLabel("思考"))
@@ -498,31 +604,45 @@ class MainWindow(QMainWindow):
     # ---------------- 窗口列表 ----------------
     def refresh_windows(self) -> None:
         self.combo.clear()
-        for hwnd, title, cls, rect in ScreenSource.list_windows():
-            w, h = rect[2] - rect[0], rect[3] - rect[1]
-            self.combo.addItem(f"{title}  [{cls}]  {w}x{h}", (hwnd, title))
+        # 用 list_windows_any：包含最小化的窗口，这样用户把对局窗口
+        # 最小化后依然能在列表里选到它（只是需要先还原才能识别）。
+        wins = list_windows_any(min_size=200)
+        for w in wins:
+            r = w["rect"]
+            size = f"{r[2] - r[0]}x{r[3] - r[1]}"
+            mark = "  [已最小化]" if w["minimized"] else ""
+            label = f"{w['title']}  [{w['class']}]  {size}{mark}"
+            self.combo.addItem(label, (w["hwnd"], w["title"]))
         if self.combo.count() == 0:
             self.combo.addItem("（未找到可用窗口）", None)
             return
 
-        # 优先选真正的棋局窗口：标题里带「JJ象棋 / 象棋」的独立小程序窗口，
-        # 而不是整个「微信」窗口 —— 微信窗口里棋盘占比太小，
-        # 棋盘角点定位容易失败。
+        # 优先选真正在对局的棋局窗口：标题带「JJ象棋 / 象棋」，且已还原
         best = -1
-        for i in range(self.combo.count()):
-            data = self.combo.itemData(i)
-            if not data:
-                continue
-            title = data[1]
-            if "JJ象棋" in title:
+        for i, w in enumerate(wins):
+            if "JJ象棋" in w["title"] and not w["minimized"]:
                 best = i
                 break
-            if "象棋" in title and best < 0:
-                best = i
+        if best < 0:
+            for i, w in enumerate(wins):
+                if "JJ象棋" in w["title"]:
+                    best = i
+                    break
+        if best < 0:
+            for i, w in enumerate(wins):
+                if "象棋" in w["title"] and not w["minimized"]:
+                    best = i
+                    break
+
         if best >= 0:
             self.combo.setCurrentIndex(best)
-            self.statusBar().showMessage(
-                f"已选中棋局窗口：{self.combo.currentText().split('  [')[0]} · 点「开始」")
+            w = wins[best]
+            if w["minimized"]:
+                self.statusBar().showMessage(
+                    f"已选中 {w['title']}，但它处于最小化状态 —— 请先还原窗口再点「开始」")
+            else:
+                self.statusBar().showMessage(
+                    f"已选中棋局窗口：{w['title']} · 点「开始」")
         else:
             self.statusBar().showMessage(
                 "未自动找到棋局窗口，请在下拉框里手动选择 JJ象棋 窗口")
@@ -538,6 +658,11 @@ class MainWindow(QMainWindow):
             return
         hwnd, title = data
         self.source.attach(hwnd, title)
+        # 开始前先检查窗口状态，避免"最小化导致识别全错"这种难排查的情况
+        win_ok, minimized, note = window_state(hwnd)
+        if not win_ok:
+            QMessageBox.warning(self, "提示", note or "目标窗口不可用")
+            return
         if self.source.grab() is None:
             QMessageBox.warning(self, "提示", f"无法抓取窗口画面：{title}")
             return
@@ -546,6 +671,7 @@ class MainWindow(QMainWindow):
         self.worker.movetime = self.spin_mt.value()
         self.worker.confirm = self.spin_conf.value()
         self.worker.first_side = self.combo_side.currentData() or "w"
+        self.worker.my_side = self.combo_my_side.currentData() or "w"
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -556,6 +682,8 @@ class MainWindow(QMainWindow):
         self.thread.start()
         self.btn_run.setText("停止")
         self.combo.setEnabled(False)
+        self.combo_my_side.setEnabled(False)
+        self.combo_side.setEnabled(False)
 
     def stop(self) -> None:
         if self.worker:
@@ -565,18 +693,28 @@ class MainWindow(QMainWindow):
     # ---------------- 结果 ----------------
     @Slot(object, object, str, dict, str)
     def on_frame(self, bgr, warped, fen: str, diag: dict, key: str) -> None:
+        # key 里的矩阵已是「标准朝向」（我方执黑时被翻转 180° 过）。
+        flipped = bool(diag.get("flipped"))
+        # 为了在真实画面上标注红圈，需要「画面朝向」的矩阵：翻转回来即可。
         rows = [key[i * 9:(i + 1) * 9] for i in range(10)]
+        if flipped:
+            rows = Worker.flip_rows(rows)
         alts = diag.get("alts") or []
         # 棋盘 + 走法箭头（最佳着法画绿色粗箭头，候选着法画蓝色细箭头）
-        self.board.update_board(warped, rows, diag.get("arrow"), alts)
+        # 箭头坐标会由 BoardView 依据 flipped 做 180° 映射，以贴合画面朝向
+        self.board.update_board(warped, rows, diag.get("arrow"), alts, flipped)
         self.lbl_fen.setText(fen)
 
         side_cn = "红方走" if diag.get("side") == "w" else "黑方走"
         self.lbl_best.setText(f"{diag.get('best', '—')}   {diag.get('chinese', '')}")
+        self.lbl_winrate.setText(diag.get("winrate", "—"))
+        # 技术指标挪到副行与状态栏，避免干扰主要信息
         self.lbl_best_sub.setText(
             f"{side_cn} · 分数 {diag.get('score')} · 深度 {diag.get('depth')} · "
+            f"合法着法 {diag.get('moves', 0)}")
+        self.statusBar().showMessage(
             f"识别 {diag.get('t_recog', 0):.0f}ms · "
-            f"最低置信 {diag.get('conf', 0):.2f} · 合法着法 {diag.get('moves', 0)}")
+            f"最低置信 {diag.get('conf', 0):.2f} · {diag.get('guard', '')}")
         if diag.get("note"):
             self.lbl_side_note.setText(diag["note"])
             self.lbl_side_note.show()
@@ -602,6 +740,8 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.btn_run.setText("开始")
         self.combo.setEnabled(True)
+        self.combo_my_side.setEnabled(True)
+        self.combo_side.setEnabled(True)
         self.statusBar().showMessage("已停止")
 
     def closeEvent(self, ev) -> None:
