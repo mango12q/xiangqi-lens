@@ -24,17 +24,45 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 
 
+def app_base() -> Path:
+    """返回"应用根目录"—— 资源应当相对它来查找。
+
+    * 源码运行：脚本所在目录
+    * PyInstaller 打包后（``sys.frozen``）：**exe 所在目录**。
+      注意不能用 ``sys._MEIPASS``，那是临时解包目录；模型与引擎
+      体积大（约 95MB），是作为外部文件放在 exe 同级的，这样
+      后续也能单独替换模型而不必重新打包。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return HERE
+
+
 def _find_research() -> Path:
     """定位识别/引擎资源目录（xq_research）。
 
-    依次尝试：本目录下 → 上级目录下。找到第一个含 hf_model 的即可，
-    避免把资源目录硬编码成某一个位置。
+    按顺序尝试若干候选位置，取第一个含 ``hf_model`` 的：
+      1. <应用根目录>/xq_research
+      2. <应用根目录>/../xq_research
+      3. <应用根目录>/resources/xq_research
+      4. 当前工作目录及其父目录下的 xq_research
+
+    之所以给这么多候选，是因为它既要支持源码运行，也要支持打包后
+    exe 与资源同级或放在 resources 子目录这两种发行方式。
     """
-    for base in (HERE, HERE.parent):
-        cand = base / "xq_research"
+    base = app_base()
+    cands = [
+        base / "xq_research",
+        base.parent / "xq_research",
+        base / "resources" / "xq_research",
+        Path.cwd() / "xq_research",
+        Path.cwd().parent / "xq_research",
+    ]
+    for cand in cands:
         if (cand / "hf_model").is_dir():
             return cand
-    return HERE / "xq_research"          # 兜底，后续报错会指出具体缺失项
+    # 兜底：返回首选位置，让后续报错明确指出缺什么
+    return base / "xq_research"
 
 
 RESEARCH = _find_research()
@@ -989,59 +1017,149 @@ class BoardTracker:
 # ---------------------------------------------------------------------------
 # 自检
 # ---------------------------------------------------------------------------
+def _find_test_image() -> Path | None:
+    """找一个用于自检的测试图。
+
+    打包发行时不会有 ``shots/`` 目录（那是我开发时的调试产物），
+    所以这里按候选顺序找，找不到就返回 None —— 由调用方决定
+    是否跳过识别环节，只验证资源与引擎。
+    """
+    base = app_base()
+    cands = []
+    if HERE != base:
+        cands.append(HERE / "shots" / "bg_002A0A30.png")
+    cands += [
+        base / "shots" / "bg_002A0A30.png",
+        base / "docs" / "arrow-demo.jpg",
+        base / "docs" / "screenshot.png",
+        Path.cwd() / "shots" / "bg_002A0A30.png",
+    ]
+    for c in cands:
+        if c.is_file():
+            return c
+    return None
+
+
 def selftest(image: str | None, movetime: int) -> int:
-    print("=" * 68)
-    print("XiangQiLens 自检 —— 识别 → FEN → 棋规 → 引擎")
-    print("=" * 68)
-    print(f"DPI 感知 : {enable_dpi_awareness()}")
-    print(f"识别模型 : {POSE_ONNX.name} + {CLS_ONNX.name}")
-    print(f"引擎     : {ENGINE_EXE.name}")
+    """自检。返回 0 表示通过。
 
-    img_path = Path(image) if image else HERE / "shots" / "bg_002A0A30.png"
-    bgr = cv2.imdecode(np.fromfile(str(img_path), dtype=np.uint8), cv2.IMREAD_COLOR)
-    if bgr is None:
-        print(f"[失败] 读图失败: {img_path}")
+    注意：打包成 ``--windowed`` 的 exe 运行时没有控制台，``print`` 会因
+    ``sys.stdout is None`` 而失败。因此这里把日志同时写到文件，
+    便于打包后排查（日志路径会显示在弹窗/错误信息里）。
+    """
+    log_lines: list[str] = []
+
+    def say(msg: str = "") -> None:
+        log_lines.append(msg)
+        try:
+            if sys.stdout is not None:
+                print(msg)
+        except Exception:
+            pass
+
+    say("=" * 68)
+    say("XiangQiLens 自检")
+    say("=" * 68)
+    say(f"运行模式 : {'打包 exe' if getattr(sys, 'frozen', False) else '源码'}")
+    say(f"DPI 感知 : {enable_dpi_awareness()}")
+    say(f"应用根目录: {app_base()}")
+    say(f"资源目录 : {RESEARCH}")
+    say(f"识别模型 : {POSE_ONNX.name} + {CLS_ONNX.name}")
+    say(f"引擎     : {ENGINE_EXE.name}")
+
+    # ---- 资源存在性（打包后最关键的检查项）----
+    say()
+    say("[0/4] 资源检查")
+    missing = []
+    for name, p in (("pose 模型", POSE_ONNX), ("分类模型", CLS_ONNX),
+                    ("引擎 exe", ENGINE_EXE),
+                    ("引擎权重", ENGINE_EXE.parent / "pikafish.nnue")):
+        ok = p.is_file()
+        size = f"{p.stat().st_size / 1024 / 1024:.1f} MB" if ok else "-"
+        say(f"      [{'OK ' if ok else '缺失'}] {name:10} {size:>9}  {p}")
+        if not ok:
+            missing.append(name)
+    if missing:
+        say(f"      [失败] 缺少: {', '.join(missing)}")
+        say("             请确认 xq_research 与本程序在同一目录")
+        _write_selftest_log(log_lines)
         return 1
-    print(f"测试图   : {img_path.name}  {bgr.shape[1]}x{bgr.shape[0]}")
 
-    print()
-    print("[1/4] 加载识别模型")
-    t0 = time.perf_counter()
-    vision = create_vision(cuda=True)
-    print(f"      {time.perf_counter() - t0:.2f}s")
+    img_path = Path(image) if image else _find_test_image()
+    if img_path is None or not img_path.is_file():
+        say()
+        say("[识别环节] 跳过（未找到测试图，发行版不含调试截图，属正常）")
+        say("           直接验证棋规与引擎")
+        fen = ("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/"
+               "P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1")
+        say(f"      用标准开局 FEN: {fen.split()[0]}")
+        t_recog = 0.0
+    else:
+        say(f"测试图   : {img_path.name}")
+        bgr = cv2.imdecode(np.fromfile(str(img_path), dtype=np.uint8),
+                           cv2.IMREAD_COLOR)
+        if bgr is None:
+            say(f"[失败] 读图失败: {img_path}")
+            _write_selftest_log(log_lines)
+            return 1
+        say(f"      尺寸: {bgr.shape[1]}x{bgr.shape[0]}")
 
-    print("[2/4] 识别棋盘")
-    t0 = time.perf_counter()
-    res = vision.infer(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-    t_recog = (time.perf_counter() - t0) * 1000
-    for i, row in enumerate(res["rows"]):
-        print(f"      row{i}: {row}   minConf={res['conf'][i].min():.2f}")
-    fen = vision.to_fen(res["rows"], side_to_move="w")
-    print(f"      FEN   : {fen}")
-    print(f"      耗时  : pose={res['t_pose_ms']:.1f}ms  cls={res['t_cls_ms']:.1f}ms")
+        say()
+        say("[1/4] 加载识别模型")
+        t0 = time.perf_counter()
+        vision = create_vision(cuda=True)
+        say(f"      {time.perf_counter() - t0:.2f}s")
 
-    print("[3/4] cchess 棋规校验")
+        say("[2/4] 识别棋盘")
+        t0 = time.perf_counter()
+        res = vision.infer(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        t_recog = (time.perf_counter() - t0) * 1000
+        for i, row in enumerate(res["rows"]):
+            say(f"      row{i}: {row}   minConf={res['conf'][i].min():.2f}")
+        fen = vision.to_fen(res["rows"], side_to_move="w")
+        say(f"      FEN   : {fen}")
+        say(f"      耗时  : pose={res['t_pose_ms']:.1f}ms  cls={res['t_cls_ms']:.1f}ms")
+
+    say("[3/4] cchess 棋规校验")
     ok, err, n_moves = validate_fen(fen)
     if not ok:
-        print(f"      [失败] {err}")
+        say(f"      [失败] {err}")
+        _write_selftest_log(log_lines)
         return 2
-    print(f"      通过，合法着法 {n_moves} 个")
+    say(f"      通过，合法着法 {n_moves} 个")
 
-    print("[4/4] 引擎分析")
-    eng = create_engine(threads=8, hash_mb=256)
+    say("[4/4] 引擎分析")
+    try:
+        eng = create_engine(threads=8, hash_mb=256)
+    except Exception as exc:
+        say(f"      [失败] 引擎启动失败: {exc}")
+        _write_selftest_log(log_lines)
+        return 3
     t0 = time.perf_counter()
     r = eng.analyse(fen, movetime_ms=movetime)
     best = r.get("bestmove") or ""
-    print(f"      bestmove = {best} ({move_to_chinese(fen, best)})")
-    print(f"      score    = {format_score(r.get('score_cp'))}   depth = {r.get('depth')}")
-    print(f"      耗时     = {time.perf_counter() - t0:.2f}s")
-
-    from cchess import ChessBoard
-    legal = {"%s%s%s%s" % (chr(97 + a), r1, chr(97 + b), r2)
-             for (a, r1), (b, r2) in ChessBoard(fen).create_moves()}
-    print(f"      着法合法 : {best in legal}")
+    say(f"      bestmove = {best} ({move_to_chinese(fen, best)})")
+    say(f"      score    = {format_score(r.get('score_cp'))}   depth = {r.get('depth')}")
+    say(f"      耗时     = {time.perf_counter() - t0:.2f}s")
+    # 用 is_legal_move 校验（不要用 create_moves 的坐标 —— 实测其
+    # (row,col) 编码与 ICCS 并非简单对应，会得出错误结论）
+    say(f"      着法合法 : {is_legal_move(fen, best)}")
 
     eng.quit()
-    print()
-    print(f"[通过] 全链路可用 · 识别 {t_recog:.0f} ms/帧")
+    say()
+    if t_recog > 0:
+        say(f"[通过] 全链路可用 · 识别 {t_recog:.0f} ms/帧")
+    else:
+        say("[通过] 资源、棋规与引擎均可用")
+
+    _write_selftest_log(log_lines)
     return 0
+
+
+def _write_selftest_log(lines: list[str]) -> None:
+    """把自检日志写到应用根目录，便于打包后的 exe 排查问题。"""
+    try:
+        p = app_base() / "selftest.log"
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass

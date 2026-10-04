@@ -41,7 +41,17 @@
 
 ## 快速开始
 
-### 1. 环境
+### 方式 A：下载预编译版（推荐，无需 Python）
+
+从 [Releases](https://github.com/mango12q/xiangqi-lens/releases) 下载 `XiangQiLens-v0.1.0.zip`，
+解压后双击 **`XiangQiLens.exe`**。
+
+> ⚠️ 请**解压后整目录使用**，不要只把 exe 单独拷出来 ——
+> exe 需要同级的 `xq_research/` 提供识别模型与引擎（约 95MB）。
+
+系统要求：Windows 10/11 64 位。
+
+### 方式 B：从源码运行
 
 需要 Python 3.10+（开发环境为 3.13）。推荐用 DirectML 版 onnxruntime 走 GPU：
 
@@ -53,9 +63,21 @@ pip install onnxruntime-directml     # Windows + 任意显卡；纯 CPU 用 onnx
 > **性能差异很大**：默认的 `onnxruntime` 是 CPU 版，即使代码里请求 CUDA 也会静默降级。
 > 实测识别耗时 CPU 版约 980ms/帧，DirectML 版约 170ms/帧。详见下文「性能」。
 
-### 2. 下载模型与引擎
+然后下载模型与引擎（见下节），再运行：
 
-这两项体积较大且各有许可证，未纳入版本库。
+```bash
+python app_vision.py
+```
+
+自检（不启动界面，验证环境是否正常）：
+
+```bash
+python app_vision.py --selftest
+```
+
+### 依赖资源：模型与引擎
+
+这两项体积较大且各有许可证，未纳入版本库（预编译版已内含）。
 
 **识别模型**（来自 [Chinese_Chess_Recognition](https://huggingface.co/spaces/yolo12138/Chinese_Chess_Recognition)，MIT）：
 从 HuggingFace Space 下载两个 ONNX 权重，放到指定位置：
@@ -79,24 +101,14 @@ xq_research/pikafish/pikafish.nnue
 python tools/setup_engine.py
 ```
 
-### 3. 运行
-
-```bash
-python app_vision.py
-```
+### 操作步骤
 
 1. 把对局窗口开到棋盘可见
 2. 在「目标窗口」下拉框里选**棋局窗口本身**（如 `JJ象棋 [Chrome_WidgetWin_0]`），
    不要选整个聊天/宿主窗口 —— 棋盘占比太小会导致角点定位失败
 3. **设置「我方执子」** —— 见下方说明，这一项**选错会让所有建议失效**
 4. 设置「先手」（当前轮到谁走）
-5. 点「开始」
-
-自检（不启动界面，验证环境是否正常）：
-
-```bash
-python app_vision.py --selftest
-```
+5. 点「开始」```
 
 #### 「我方执子」与「先手」是两回事
 
