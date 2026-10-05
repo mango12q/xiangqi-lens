@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import queue
 import sys
 import time
 from pathlib import Path
@@ -28,20 +29,23 @@ except OSError:
 
 sys.path.insert(0, str(HERE))
 
-from app_backend import (HERE as BACKEND_DIR, ScreenSource, __version__,
-                         check_board_geometry, check_position, create_engine,
-                         create_vision, enable_dpi_awareness, fen_with_side,
-                         format_score, format_winrate, list_windows_any,
-                         move_arrow, move_to_chinese, parse_alternatives,
-                         parse_wdl, selftest, validate_fen, window_state)
+from app_backend import (HERE as BACKEND_DIR, MultiPVBuffer, ScreenSource,
+                         __version__, apply_engine_options, check_board_geometry,
+                         check_position, clear_hash, create_engine, create_vision,
+                         enable_dpi_awareness, fen_with_side, format_score,
+                         format_winrate, list_windows_any, move_arrow,
+                         move_to_chinese, parse_engine_options, pv_to_chinese,
+                         selftest, short_winrate, validate_fen, wdl_to_red,
+                         window_state)
 
 from PySide6.QtCore import QObject, QRect, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
-from PySide6.QtWidgets import (QApplication, QComboBox, QGroupBox,
-                               QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-                               QPushButton, QSpinBox, QSplitter, QStatusBar,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFormLayout,
+                               QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
+                               QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QPushButton, QScrollArea, QSpinBox, QSplitter,
+                               QStatusBar, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +58,10 @@ class Worker(QObject):
     status = Signal(str)
     error = Signal(str)
     done = Signal()
+    # 流式分析刷新（无图像）：引擎每加深一层就发一次，避免反复转换图像。
+    analysis_update = Signal(str, dict)
+    # 引擎握手时声明的可调选项，用于动态构建「高级」面板。
+    engine_options = Signal(list)
 
     def __init__(self, source: ScreenSource) -> None:
         super().__init__()
@@ -62,6 +70,12 @@ class Worker(QObject):
         self.hash_mb = 256
         self.movetime = 1200
         self.confirm = 3
+        # ---- 引擎参数（UI 可调） ----
+        self.multipv = 3               # 多主变例条数
+        self.infinite = False          # 持续加深（go infinite）
+        self.move_overhead = 0
+        self.show_wdl = True
+        self.engine_opts: dict = {}    # 「高级」面板里手改的选项 {name: value}
         # first_side：首帧轮次（红先/黑先），只影响"该谁走"
         self.first_side = "w"
         # my_side：我方执子方（红/黑）。**只影响两处呈现**：胜率视角
@@ -77,6 +91,23 @@ class Worker(QObject):
         self._published = ""
         self._tracker = None
         self._last_fen = ""
+        # ---- 非阻塞引擎驱动状态 ----
+        self._searching = False        # 当前是否有搜索在进行
+        self._search_fen = ""          # 正在分析的 FEN
+        self._multi = 1                # 引擎当前已下发的 MultiPV
+        self._pv = MultiPVBuffer()     # 累积的 MultiPV 结果
+        self._turn_checked = False     # 本局面是否已做过轮次校正
+        self._cur_fen_base = ""        # 当前局面的棋盘段（不含轮次）
+        self._cur_side = "w"
+        self._cur_warp_mat = None      # 画箭头用的透视矩阵
+        self._cur_ctx: dict = {}       # 每帧识别上下文（conf/t_recog/moves/note…）
+        self._last_emit = 0.0          # analysis_update 节流时间戳
+        self._last_rebuild = 0.0       # 引擎重建重试节流时间戳
+        self._cn_cache: dict = {}      # (fen, pv) → 中文序列，避免重复回放
+        # 主线程 → Worker 的参数变更命令队列。
+        # 不能用 Qt 信号：run() 是个长驻阻塞循环，永远不会把控制权交回该线程
+        # 的事件循环，queued 连接的槽函数根本不会被派发。
+        self._cmds: queue.Queue = queue.Queue()
         self._log_path, self._log_fh = self._open_log()
 
     @staticmethod
@@ -167,7 +198,15 @@ class Worker(QObject):
 
         self.status.emit("③ 启动 Pikafish 引擎…")
         try:
-            self._engine = create_engine(self.threads, self.hash_mb)
+            self._engine = create_engine(self.threads, self.hash_mb,
+                                         options=self._extra_options())
+            # MultiPV 单独下发（create_engine 只处理 Threads/Hash）
+            self._multi = 1
+            if self.multipv != 1:
+                self._engine.set_option("MultiPV", self.multipv)
+                self._multi = self.multipv
+            # 把引擎声明的可调项发给 UI，用于构建「高级」面板
+            self.engine_options.emit(parse_engine_options(self._engine.option_lines))
         except Exception as exc:
             self.error.emit(f"引擎启动失败: {exc}")
             self.done.emit()
@@ -182,6 +221,11 @@ class Worker(QObject):
         _last_state_note = ""
         while self._run:
             t0 = time.perf_counter()
+            # 每轮循环顶部先消费引擎输出：引擎在独立进程里持续加深，
+            # 这里只是非阻塞取结果并流式刷新 PV（放在顶部是因为下面有大量
+            # continue 分支会跳过循环末尾）。
+            self._process_commands()
+            self._pump_engine()
 
             # 先查窗口状态：最小化时截图拿不到棋盘，必须明确告知用户，
             # 否则只会表现为"局面不合法"，让人摸不着头脑。
@@ -286,58 +330,10 @@ class Worker(QObject):
             self._published = key
             t_recog = (time.perf_counter() - t0) * 1000
             self._log(f"采纳局面({reason}) {fen}  识别 {t_recog:.0f}ms")
-            self.status.emit(move_note or "引擎分析中…")
-            try:
-                r = self._engine.analyse(fen, movetime_ms=self.movetime)
-            except Exception as exc:
-                # 引擎可能已经崩溃退出（非法局面 / 资源问题），重建它，
-                # 否则后续每一帧都会在同一个死进程上重复失败。
-                self.error.emit(f"引擎异常，正在重启: {exc}")
-                self._log(f"引擎异常: {exc}")
-                try:
-                    self._engine.quit()
-                except Exception:
-                    pass
-                self._engine = None
-                try:
-                    self._engine = create_engine(self.threads, self.hash_mb)
-                    self.status.emit("引擎已重启")
-                except Exception as exc2:
-                    self.error.emit(f"引擎重启失败: {exc2}")
-                time.sleep(0.5)
-                continue
-
-            best = r.get("bestmove") or ""
-            # 用引擎着法的合法性反推轮次（能自动纠正开局猜错的情况）
-            if self._tracker.correct_by_engine_move(best):
-                side = self._tracker.side_to_move
-                fen = fen_with_side(fen_base, side)
-                move_note = f"轮次已校正为{'红' if side == 'w' else '黑'}方走"
-                try:
-                    r = self._engine.analyse(fen, movetime_ms=self.movetime)
-                    best = r.get("bestmove") or ""
-                except Exception as exc:
-                    self.error.emit(f"引擎重算失败: {exc}")
-                    continue
-
-            alts = parse_alternatives(r.get("info", []), fen)
-            # 为每个候选着法算好箭头坐标（拉正图坐标 + 原图坐标）
-            for a in alts:
-                a["arrow"] = move_arrow(res["warp_mat"], a["iccs"])
-
-            # 从引擎 info 行里取 wdl（胜/和/负），转成我方视角的胜率描述
-            wdl = None
-            for line in reversed(r.get("info", [])):
-                wdl = parse_wdl(line)
-                if wdl is not None:
-                    break
-            winrate = format_winrate(wdl, r.get("score_cp"), self.my_side)
-
-            diag = {
-                "score": format_score(r.get("score_cp")),
-                "depth": r.get("depth"),
-                "best": best,
-                "chinese": move_to_chinese(fen, best) if best else "",
+            # 暂存本帧识别上下文；diag 由 _build_diag 从引擎 PV 快照组装
+            self._cur_fen_base, self._cur_side = fen_base, side
+            self._cur_warp_mat = res["warp_mat"]
+            self._cur_ctx = {
                 "t_recog": t_recog,
                 "conf": float(res["conf"].min()),
                 "moves": n_moves,
@@ -346,12 +342,21 @@ class Worker(QObject):
                 # 仅表示「左栏显示图是否转 180° 让画面朝向与我方一致」，
                 # 与矩阵/FEN 无关（矩阵永远保持标准朝向）
                 "flipped": self.my_side == "b",
-                "winrate": winrate,
-                "wdl": wdl,
-                "arrow": move_arrow(res["warp_mat"], best),
-                "alts": alts,
-                "guard": self._tracker.stats,
             }
+            self.status.emit(move_note or "引擎分析中…")
+            try:
+                # 非阻塞发起搜索：立即返回，结果由 _pump_engine 流式补齐
+                self._start_search(fen)
+            except Exception as exc:
+                # 引擎可能已经崩溃退出（非法局面 / 资源问题），重建它，
+                # 否则后续每一帧都会在同一个死进程上重复失败。
+                # 注意这里**不能 continue**：key 已写入 _published，本帧若跳过就
+                # 不会再被采纳，棋盘图会一直停在上一局面上。继续往下发 frame_ready。
+                self.error.emit(f"引擎异常，正在重启: {exc}")
+                self._log(f"引擎异常: {exc}")
+                self._rebuild_engine()
+
+            diag = self._build_diag()
             warped = cv2.cvtColor(res["warped"], cv2.COLOR_RGB2BGR)
             if self.my_side == "b":
                 # 只转「拿来显示」的那张图：我方执黑时让盘面在左栏里也是
@@ -359,7 +364,7 @@ class Worker(QObject):
                 warped = cv2.rotate(warped, cv2.ROTATE_180)
             self.frame_ready.emit(bgr, warped, fen, diag, key)
             side_cn = "红" if side == "w" else "黑"
-            self.status.emit(f"{side_cn}方走 · 深度 {diag['depth']} · "
+            self.status.emit(f"{side_cn}方走 · 深度 {diag['depth'] or '—'} · "
                              f"分数 {diag['score']} · 识别 {t_recog:.0f}ms · "
                              f"{self._tracker.stats}")
 
@@ -371,10 +376,14 @@ class Worker(QObject):
     def shutdown(self) -> None:
         self._run = False
         if self._engine is not None:
+            # 若正处于 go infinite 搜索中，先 stop 再 quit，避免引擎等待搜索结束
             try:
-                self._engine.quit()
+                if self._searching:
+                    self._engine.send("stop")
+                    self._searching = False
             except Exception:
                 pass
+            self._dispose_engine(self._engine)
             self._engine = None
         if self._log_fh is not None:
             try:
@@ -383,6 +392,365 @@ class Worker(QObject):
             except Exception:
                 pass
             self._log_fh = None
+
+    # ---------------- 引擎驱动（非阻塞 + 流式 MultiPV） ----------------
+    def _extra_options(self) -> dict:
+        """组装除 Threads/Hash 外的引擎选项（用于 create_engine / 重建）。"""
+        opts = dict(self.engine_opts)
+        if self.move_overhead:
+            opts["Move Overhead"] = self.move_overhead
+        opts["UCI_ShowWDL"] = bool(self.show_wdl)
+        return opts
+
+    def _drain_lines(self) -> list[str]:
+        """非阻塞取空引擎输出队列（reader 线程在另一端持续灌入）。"""
+        out: list[str] = []
+        if self._engine is None:
+            return out
+        q = self._engine.q
+        while True:
+            try:
+                out.append(q.get_nowait())
+            except Exception:
+                break
+        return out
+
+    def _start_search(self, fen: str) -> None:
+        """停掉旧搜索，按当前参数对 fen 发起新搜索（不阻塞，立即返回）。"""
+        eng = self._engine
+        if eng is None:
+            return
+        if self._searching:
+            self._stop_search()
+        # MultiPV 跨搜索保持，只在变化时下发
+        if self.multipv != self._multi:
+            eng.set_option("MultiPV", self.multipv)
+            self._multi = self.multipv
+        self._pv.clear()
+        self._turn_checked = False
+        self._search_fen = fen
+        eng.drain()
+        eng.send(f"position fen {fen}")
+        if self.infinite:
+            eng.send("go infinite")
+        else:
+            eng.send(f"go movetime {int(self.movetime)}")
+        self._searching = True
+        self._last_emit = 0.0
+
+    def _stop_search(self, timeout: float = 0.5) -> str | None:
+        """停止当前搜索并取回 bestmove（仅在有搜索时才发 stop）。"""
+        eng = self._engine
+        if eng is None or not self._searching:
+            return None
+        best = None
+        try:
+            eng.send("stop")
+            lines = eng.wait_for("bestmove", timeout=timeout)
+            for ln in lines:
+                if ln.startswith("bestmove"):
+                    parts = ln.split()
+                    best = parts[1] if len(parts) > 1 else None
+        except Exception:
+            pass
+        self._searching = False
+        return best
+
+    @staticmethod
+    def _dispose_engine(eng) -> None:
+        """关闭引擎进程，并显式关掉 stdin 管道。
+
+        ``UciEngine.quit()`` 之后 stdin 仍是打开状态；对象被 GC 时 Python 会
+        尝试向（可能已死的）进程 flush，打印
+        ``Exception ignored ... OSError: [Errno 22] Invalid argument``。
+        显式关闭即可消除这类噪音。
+
+        **只关 stdin，不能关 stdout** —— reader 线程正阻塞在读它，
+        关掉会抛 ValueError 把线程打死。
+        """
+        if eng is None:
+            return
+        try:
+            eng.quit()
+        except Exception:
+            pass
+        try:
+            if eng.proc is not None and eng.proc.stdin is not None:
+                eng.proc.stdin.close()
+        except Exception:
+            pass
+
+    def _rebuild_engine(self) -> None:
+        """引擎进程崩溃/退出后重建，恢复参数，并重新分析当前局面。"""
+        self._searching = False
+        self._pv.clear()
+        self._cn_cache.clear()
+        self._last_rebuild = time.perf_counter()
+        self._dispose_engine(self._engine)
+        self._engine = None
+        try:
+            self._engine = create_engine(self.threads, self.hash_mb,
+                                         options=self._extra_options())
+            self._multi = 1
+            if self.multipv != 1:
+                self._engine.set_option("MultiPV", self.multipv)
+                self._multi = self.multipv
+            self.engine_options.emit(parse_engine_options(self._engine.option_lines))
+            self.status.emit("引擎已重启")
+        except Exception as exc:
+            self.error.emit(f"引擎重启失败: {exc}")
+            self._engine = None
+            return
+        # 重建成功后立刻恢复对当前局面的分析，否则面板会一直空着
+        # 直到棋盘下一次变化。
+        if self._cur_fen_base:
+            try:
+                self._start_search(fen_with_side(self._cur_fen_base, self._cur_side))
+            except Exception as exc:
+                self.error.emit(f"重建后重算失败: {exc}")
+
+    def _pump_engine(self) -> None:
+        """每轮循环顶部调用：非阻塞消费引擎输出并流式刷新 PV。"""
+        if self._engine is None:
+            # 引擎不可用（重建失败）：限频重试，避免每轮都去拉起进程
+            now = time.perf_counter()
+            if now - self._last_rebuild >= 3.0:
+                self._log("引擎不可用，尝试重建")
+                self._rebuild_engine()
+            return
+        try:
+            lines = self._drain_lines()
+        except Exception:
+            lines = []
+        # 引擎进程结束（崩溃/退出）→ 重建
+        try:
+            dead = self._engine.proc.poll() is not None
+        except Exception:
+            dead = True
+        if any(l == "__EOF__" for l in lines) or dead:
+            self._log("检测到引擎进程结束，正在重建")
+            self._rebuild_engine()
+            return
+        if not lines:
+            return
+
+        best = None
+        for ln in lines:
+            if ln.startswith("bestmove"):
+                parts = ln.split()
+                best = parts[1] if len(parts) > 1 else None
+                self._searching = False
+
+        infos = [ln for ln in lines if ln.startswith("info")]
+        if infos:
+            self._pv.feed(infos)
+            snap = self._pv.snapshot(self.multipv)
+            # 首次拿到引擎着法时做轮次校正。
+            # 注：go infinite 下没有 bestmove，用 multipv=1 行的首着等价替代。
+            if snap and not self._turn_checked and self._tracker is not None:
+                pv0 = snap[0]["pv"][0] if snap[0].get("pv") else None
+                if pv0:
+                    try:
+                        corrected = self._tracker.correct_by_engine_move(pv0)
+                    except Exception:
+                        corrected = False
+                    self._turn_checked = True
+                    if corrected:
+                        self._cur_side = self._tracker.side_to_move
+                        note = f"轮次已校正为{'红' if self._cur_side == 'w' else '黑'}方走"
+                        self._cur_ctx["side"] = self._cur_side
+                        self._cur_ctx["note"] = note
+                        self._log(note)
+                        self._start_search(
+                            fen_with_side(self._cur_fen_base, self._cur_side))
+                        return
+            now = time.perf_counter()
+            if now - self._last_emit >= 0.05:      # 20Hz 节流
+                self._last_emit = now
+                self.analysis_update.emit(self._search_fen, self._build_diag(best))
+        elif best is not None and self._cur_ctx:
+            # 没有新 info 但拿到了 bestmove（movetime 结束），刷新一次终值
+            self.analysis_update.emit(self._search_fen, self._build_diag(best))
+
+    def _build_diag(self, bestmove: str | None = None) -> dict:
+        """由当前 PV 快照 + 识别上下文组装给 UI 的 diag。"""
+        ctx = self._cur_ctx or {}
+        fen = self._search_fen
+        my_side = self.my_side
+        snap = self._pv.snapshot(self.multipv)
+        # 引擎 wdl 是行棋方视角，先取出行棋方再换算成红方视角
+        _fparts = fen.split()
+        stm = _fparts[1] if len(_fparts) > 1 else "w"
+
+        lines: list[dict] = []
+        for info in snap:
+            pv = info.get("pv") or []
+            wdl = wdl_to_red(info.get("wdl"), stm)
+            cp = info.get("score_cp")
+            # 中文回放较贵（每次 ~1.4ms），按 (fen, pv) 缓存：
+            # 流式刷新时同一条主变例常常连续多轮不变，可直接命中。
+            ck = (fen, tuple(pv))
+            cn = self._cn_cache.get(ck)
+            if cn is None:
+                try:
+                    cn = pv_to_chinese(fen, pv) if pv else []
+                except Exception:
+                    cn = []
+                if len(self._cn_cache) > 128:
+                    self._cn_cache.clear()
+                self._cn_cache[ck] = cn
+            lines.append({
+                "multipv": info.get("multipv", 1),
+                "depth": info.get("depth"),
+                "seldepth": info.get("seldepth"),
+                "score_cp": cp,
+                "score": format_score(cp),
+                "wdl": wdl,
+                "winrate": short_winrate(wdl, cp, my_side),
+                "pv": pv,
+                "pv_iccs": " ".join(pv),
+                "chinese_seq": " ".join(cn),
+                "nodes": info.get("nodes"),
+                "nps": info.get("nps"),
+                "hashfull": info.get("hashfull"),
+                "time_ms": info.get("time_ms"),
+            })
+
+        top = lines[0] if lines else None
+        best = bestmove or (top["pv"][0] if top and top.get("pv") else "")
+        wdl = top["wdl"] if top else None
+        cp = top["score_cp"] if top else None
+
+        # alts：BoardView 需要每条线首着的箭头坐标
+        alts: list[dict] = []
+        for ln in lines:
+            first = ln["pv"][0] if ln.get("pv") else ""
+            if not first:
+                continue
+            alts.append({
+                "iccs": first,
+                "chinese": ln["chinese_seq"].split(" ")[0] if ln["chinese_seq"] else "",
+                "score": ln["score"],
+                "depth": ln["depth"],
+                "arrow": (move_arrow(self._cur_warp_mat, first)
+                          if self._cur_warp_mat is not None else None),
+            })
+
+        return {
+            "score": format_score(cp),
+            "depth": top["depth"] if top else None,
+            "seldepth": top["seldepth"] if top else None,
+            "best": best,
+            "chinese": move_to_chinese(fen, best) if best else "",
+            "t_recog": ctx.get("t_recog", 0.0),
+            "conf": ctx.get("conf", 0.0),
+            "moves": ctx.get("moves", 0),
+            "side": ctx.get("side", self._cur_side),
+            "note": ctx.get("note", ""),
+            "flipped": ctx.get("flipped", self.my_side == "b"),
+            "winrate": format_winrate(wdl, cp, my_side) if top else "分析中…",
+            "wdl": wdl,
+            "arrow": (move_arrow(self._cur_warp_mat, best)
+                      if (best and self._cur_warp_mat is not None) else None),
+            "alts": alts,
+            "pv": lines,
+            "nodes": top["nodes"] if top else None,
+            "nps": top["nps"] if top else None,
+            "hashfull": top["hashfull"] if top else None,
+            "time_ms": top["time_ms"] if top else None,
+            "engine_mode": "持续加深" if self.infinite else "限时",
+            "guard": self._tracker.stats if self._tracker is not None else "",
+        }
+
+    # ---- 主线程 → Worker 的命令入口（线程安全，只往队列里塞）----
+    def post_params(self, params: dict) -> None:
+        """提交引擎参数变更（主线程调用）。"""
+        self._cmds.put(("params", params))
+
+    def post_clear_hash(self) -> None:
+        """请求清空置换表（主线程调用）。"""
+        self._cmds.put(("clear", None))
+
+    def _process_commands(self) -> None:
+        """在 Worker 线程内消费命令队列（循环顶部调用）。
+
+        会**合并**积压的命令：连续改多个参数只应用最后一次，避免拖拽
+        SpinBox 时反复「停搜索→下发→重启」把引擎抖崩。
+        """
+        last_params = None
+        do_clear = False
+        drained = False
+        while True:
+            try:
+                kind, payload = self._cmds.get_nowait()
+            except queue.Empty:
+                break
+            drained = True
+            if kind == "params":
+                last_params = payload
+            elif kind == "clear":
+                do_clear = True
+        if not drained:
+            return
+        if do_clear:
+            try:
+                self.clear_hash_requested()
+            except Exception as exc:
+                self.error.emit(f"清空置换表失败: {exc}")
+        if last_params is not None:
+            try:
+                self.apply_engine_params(last_params)
+            except Exception as exc:
+                self.error.emit(f"参数应用失败: {exc}")
+
+    def apply_engine_params(self, params: dict) -> None:
+        """运行中热改引擎参数：停当前搜索 → 下发 → 用新参数重跑当前局面。"""
+        eng = self._engine
+        if eng is None:
+            return
+        try:
+            self.threads = int(params.get("threads", self.threads))
+            self.hash_mb = int(params.get("hash_mb", self.hash_mb))
+            self.multipv = max(1, int(params.get("multipv", self.multipv)))
+            self.move_overhead = int(params.get("move_overhead", self.move_overhead))
+            self.show_wdl = bool(params.get("show_wdl", self.show_wdl))
+            self.infinite = bool(params.get("infinite", self.infinite))
+            if "advanced" in params:
+                self.engine_opts = dict(params.get("advanced") or {})
+        except Exception:
+            pass
+
+        if self._searching:
+            self._stop_search()
+        try:
+            eng.set_option("Threads", self.threads)
+            eng.set_option("Hash", self.hash_mb)
+            try:
+                eng.set_option("UCI_ShowWDL", self.show_wdl)
+            except Exception:
+                pass
+            if self.move_overhead:
+                eng.set_option("Move Overhead", self.move_overhead)
+            apply_engine_options(eng, self.engine_opts)
+            self._multi = 1
+            if self.multipv != 1:
+                eng.set_option("MultiPV", self.multipv)
+                self._multi = self.multipv
+        except Exception as exc:
+            self.error.emit(f"参数下发失败: {exc}")
+            return
+
+        if self._cur_fen_base:
+            try:
+                self._start_search(fen_with_side(self._cur_fen_base, self._cur_side))
+            except Exception as exc:
+                self.error.emit(f"重算失败: {exc}")
+        self.status.emit("引擎参数已应用")
+
+    def clear_hash_requested(self) -> None:
+        if self._engine is not None:
+            clear_hash(self._engine)
+            self.status.emit("已清空置换表")
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +777,7 @@ class BoardView(QLabel):
         self._arrow: dict | None = None       # 最佳着法箭头
         self._alts: list[dict] = []           # 候选着法（含 arrow）
         self._flipped = False                 # 我方执黑：坐标需 180° 映射
+        self._qimg: QImage | None = None      # 缓存的棋盘 QImage，避免每帧重复转换
 
     def update_board(self, warped: np.ndarray, rows: list[str],
                      arrow: dict | None = None, alts: list[dict] | None = None,
@@ -418,6 +787,21 @@ class BoardView(QLabel):
         self._arrow = arrow
         self._alts = alts or []
         self._flipped = flipped
+        # 预先转好 QImage（cv2→RGB + copy），paintEvent 直接复用；
+        # 这样引擎持续加深时的高频 set_arrows 不会再重复转换图像。
+        try:
+            h, w = warped.shape[:2]
+            rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+            self._qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+        except Exception:
+            self._qimg = None
+        self.update()
+
+    def set_arrows(self, arrow: dict | None,
+                   alts: list[dict] | None = None) -> None:
+        """只更新走法箭头（引擎流式刷新时用），复用已缓存的棋盘图。"""
+        self._arrow = arrow
+        self._alts = alts or []
         self.update()
 
     def _map(self, x: float, y: float, w: int, h: int) -> tuple[float, float]:
@@ -486,11 +870,9 @@ class BoardView(QLabel):
             dw, dh = int(w * scale), int(h * scale)
             ox, oy = (aw - dw) // 2, (ah - dh) // 2
 
-            rgb = cv2.cvtColor(self._warped, cv2.COLOR_BGR2RGB)
-            qimg = QImage(rgb.data, w, h, 3 * w,
-                          QImage.Format_RGB888).copy()
-            # PySide6 的 drawImage 没有 (x, y, w, h, img) 重载，必须传 QRect
-            p.drawImage(QRect(ox, oy, dw, dh), qimg)
+            if self._qimg is not None:
+                # PySide6 的 drawImage 没有 (x, y, w, h, img) 重载，必须传 QRect
+                p.drawImage(QRect(ox, oy, dw, dh), self._qimg)
 
             # ---- 走法箭头 ----
             head = max(9.0, 17.0 * scale)
@@ -547,6 +929,8 @@ class MainWindow(QMainWindow):
         self.source = ScreenSource()
         self.worker: Worker | None = None
         self.thread: QThread | None = None
+        # 高级面板：控件引用 {name: (widget, type, default)}
+        self.adv_controls: dict = {}
         dpi = enable_dpi_awareness()
 
         # ---- 左：棋盘 ----
@@ -580,6 +964,8 @@ class MainWindow(QMainWindow):
         self.lbl_side_note.setStyleSheet("color:#e8b93c; font-size:12px;")
         self.lbl_side_note.hide()
 
+        engine_grp = self._build_engine_panel()
+
         info = QGroupBox("当前建议")
         iv = QVBoxLayout(info)
         iv.addWidget(self.lbl_best)
@@ -590,18 +976,26 @@ class MainWindow(QMainWindow):
         iv.addWidget(QLabel("局面 FEN"))
         iv.addWidget(self.lbl_fen)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["着法", "中文", "分数", "深度"])
-        self.table.horizontalHeader().setStretchLastSection(True)
+        # 多主变例（PV）：引擎真实 MultiPV 输出（中文 + ICCS 双列）
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["#", "分数", "胜率", "深度", "中文主变例", "ICCS"])
+        hh = self.table.horizontalHeader()
+        hh.setStretchLastSection(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setWordWrap(False)
         self.table.verticalHeader().setVisible(False)
+        for col in (0, 1, 2, 3, 5):
+            hh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.Stretch)
 
-        alt = QGroupBox("候选着法")
+        alt = QGroupBox("多主变例 (MultiPV)")
         av = QVBoxLayout(alt)
         av.addWidget(self.table)
 
         right = QVBoxLayout()
+        right.addWidget(engine_grp)
         right.addWidget(info)
         right.addWidget(alt, 1)
         right_box = QWidget()
@@ -630,6 +1024,14 @@ class MainWindow(QMainWindow):
         self.spin_conf.setRange(1, 10)
         self.spin_conf.setValue(3)
         self.spin_conf.setSuffix(" 帧")
+
+        # 持续加深：锁定局面后让引擎一直加深（go infinite），主变例实时刷新；
+        # 不勾选则每次识别到新局面按「思考」时间分析一次。
+        self.chk_infinite = QCheckBox("持续加深")
+        self.chk_infinite.setToolTip(
+            "勾选后引擎会锁定当前局面持续加深，主变例随深度实时刷新；\n"
+            "不勾选则每次识别到新局面，按「思考」时间分析一次。")
+        self.chk_infinite.toggled.connect(self._on_infinite_toggled)
 
         self.combo_side = QComboBox()
         self.combo_side.addItem("红方先行", "w")
@@ -668,6 +1070,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.combo_side)
         top.addWidget(QLabel("思考"))
         top.addWidget(self.spin_mt)
+        top.addWidget(self.chk_infinite)
         top.addWidget(QLabel("确认"))
         top.addWidget(self.spin_conf)
         top.addWidget(self.btn_run)
@@ -685,6 +1088,235 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage(f"DPI: {dpi} · 就绪")
         self.refresh_windows()
+
+    # ---------------- 引擎参数面板 ----------------
+    def _build_engine_panel(self) -> QGroupBox:
+        """构建「引擎参数」面板（默认折叠，节省右栏空间）。"""
+        grp = QGroupBox("引擎参数")
+        grp.setCheckable(True)
+        grp.setChecked(False)                 # 默认折叠
+
+        outer = QVBoxLayout(grp)
+        outer.setContentsMargins(6, 6, 6, 6)
+        body = QWidget()
+        grid = QGridLayout(body)
+        grid.setContentsMargins(0, 0, 0, 0)
+
+        self.spin_threads = QSpinBox()
+        self.spin_threads.setRange(1, max(1, _os.cpu_count() or 4))
+        self.spin_threads.setValue(8)
+        self.spin_hash = QSpinBox()
+        self.spin_hash.setRange(16, 4096)
+        self.spin_hash.setSingleStep(64)
+        self.spin_hash.setSuffix(" MB")
+        self.spin_hash.setValue(256)
+        self.spin_multipv = QSpinBox()
+        self.spin_multipv.setRange(1, 8)
+        self.spin_multipv.setValue(3)
+        self.spin_overhead = QSpinBox()
+        self.spin_overhead.setRange(0, 5000)
+        self.spin_overhead.setSingleStep(10)
+        self.spin_overhead.setSuffix(" ms")
+        self.chk_wdl = QCheckBox("显示胜/和/负 (WDL)")
+        self.chk_wdl.setChecked(True)
+        self.btn_clear_hash = QPushButton("清空置换表")
+
+        grid.addWidget(QLabel("线程 Threads"), 0, 0)
+        grid.addWidget(self.spin_threads, 0, 1)
+        grid.addWidget(QLabel("哈希 Hash"), 1, 0)
+        grid.addWidget(self.spin_hash, 1, 1)
+        grid.addWidget(QLabel("多主变例 MultiPV"), 2, 0)
+        grid.addWidget(self.spin_multipv, 2, 1)
+        grid.addWidget(QLabel("落子延时 Move Overhead"), 3, 0)
+        grid.addWidget(self.spin_overhead, 3, 1)
+        grid.addWidget(self.chk_wdl, 4, 0, 1, 2)
+        grid.addWidget(self.btn_clear_hash, 5, 0, 1, 2)
+        outer.addWidget(body)
+
+        # 高级：运行时由引擎 option_lines 动态生成
+        self.adv_grp = QGroupBox("高级（引擎全部可调项）")
+        self.adv_grp.setCheckable(True)
+        self.adv_grp.setChecked(False)
+        adv_outer = QVBoxLayout(self.adv_grp)
+        self.adv_scroll = QScrollArea()
+        self.adv_scroll.setWidgetResizable(True)
+        self.adv_scroll.setMaximumHeight(220)
+        self.adv_body = QWidget()
+        self.adv_form = QFormLayout(self.adv_body)
+        self.adv_scroll.setWidget(self.adv_body)
+        adv_outer.addWidget(self.adv_scroll)
+        outer.addWidget(self.adv_grp)
+        self.adv_grp.setVisible(False)        # 拿到引擎选项前不显示
+        self.adv_scroll.setVisible(False)
+        self.adv_grp.toggled.connect(self.adv_scroll.setVisible)
+
+        # 折叠行为：未勾选时隐藏参数体
+        body.setVisible(False)
+        grp.toggled.connect(body.setVisible)
+
+        # 控件变化 → 通知 Worker 热改
+        for w in (self.spin_threads, self.spin_hash, self.spin_multipv,
+                  self.spin_overhead):
+            w.valueChanged.connect(self._on_param_changed)
+        self.chk_wdl.toggled.connect(self._on_param_changed)
+        self.btn_clear_hash.clicked.connect(self._on_clear_hash)
+        return grp
+
+    def _on_infinite_toggled(self, on: bool) -> None:
+        """「持续加深」勾选时禁用「思考」时间（该模式下无意义）。"""
+        self.spin_mt.setEnabled(not on)
+        self._on_param_changed()
+
+    def _on_param_changed(self, *_args) -> None:
+        # 只往 Worker 的命令队列里塞，由 Worker 线程自己消费（见 Worker.post_params）。
+        # 不能用 Qt 信号：run() 是长驻阻塞循环，不会派发 queued 连接。
+        if self.worker is not None:
+            self.worker.post_params(self._collect_engine_params())
+
+    def _on_clear_hash(self) -> None:
+        if self.worker is not None:
+            self.worker.post_clear_hash()
+
+    @staticmethod
+    def _adv_value(w, typ):
+        """读取高级面板控件的当前值（归一成 int/bool/str）。"""
+        if typ == "spin":
+            return int(w.value())
+        if typ == "check":
+            return bool(w.isChecked())
+        if typ == "combo":
+            return w.currentText()
+        return w.text()
+
+    def _collect_advanced(self) -> dict:
+        """只收集用户**实际改动过**的高级选项。
+
+        以控件建好时的真实初值为基准（而不是引擎 option 行里的 default 字符串），
+        避免 combo 的 default 不在 var 列表里时误报「已改动」而spurious下发。
+        """
+        out: dict = {}
+        for name, (w, typ, initial) in self.adv_controls.items():
+            try:
+                v = self._adv_value(w, typ)
+                if v != initial:
+                    out[name] = v
+            except Exception:
+                continue
+        return out
+
+    def _collect_engine_params(self) -> dict:
+        return {
+            "threads": self.spin_threads.value(),
+            "hash_mb": self.spin_hash.value(),
+            "multipv": self.spin_multipv.value(),
+            "move_overhead": self.spin_overhead.value(),
+            "show_wdl": self.chk_wdl.isChecked(),
+            "infinite": self.chk_infinite.isChecked(),
+            "advanced": self._collect_advanced(),
+        }
+
+    # 已在「引擎参数」精选区提供控件的选项，高级区不再重复（避免两处打架）
+    _CURATED_OPTS = ("Threads", "Hash", "MultiPV", "Move Overhead",
+                     "UCI_ShowWDL", "Clear Hash")
+
+    @Slot(list)
+    def on_engine_options(self, options: list) -> None:
+        """引擎握手后拿到可调项列表，动态构建「高级」面板。"""
+        while self.adv_form.count():
+            item = self.adv_form.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self.adv_controls.clear()
+
+        for opt in options:
+            name, typ = opt.get("name", ""), opt.get("type", "")
+            default = opt.get("default", "")
+            if not name or typ == "button" or name in self._CURATED_OPTS:
+                continue          # button 型用独立的「清空置换表」按钮
+            if typ == "spin":
+                w = QSpinBox()
+                lo, hi = opt.get("min"), opt.get("max")
+                w.setRange(int(lo) if lo is not None else -1000000,
+                           int(hi) if hi is not None else 1000000)
+                try:
+                    w.setValue(int(default))
+                except Exception:
+                    pass
+                w.valueChanged.connect(self._on_param_changed)
+            elif typ == "check":
+                w = QCheckBox()
+                w.setChecked(str(default).lower() == "true")
+                w.toggled.connect(self._on_param_changed)
+            elif typ == "combo":
+                w = QComboBox()
+                for v in (opt.get("var") or []):
+                    w.addItem(str(v))
+                idx = w.findText(str(default))
+                if idx >= 0:
+                    w.setCurrentIndex(idx)
+                w.currentIndexChanged.connect(self._on_param_changed)
+            else:
+                w = QLineEdit(str(default))
+                typ = "string"
+                w.editingFinished.connect(self._on_param_changed)
+            self.adv_form.addRow(name, w)
+            # 记录控件真实初值作为「未改动」基准（见 _collect_advanced）
+            self.adv_controls[name] = (w, typ, self._adv_value(w, typ))
+
+        self.adv_grp.setVisible(bool(self.adv_controls))
+
+    # ---------------- 结果渲染 ----------------
+    def _fill_pv_table(self, diag: dict) -> None:
+        """用真实 MultiPV 结果填充主变例表（中文 + ICCS 双列）。"""
+        lines = diag.get("pv") or []
+        self.table.setRowCount(len(lines))
+        for i, ln in enumerate(lines):
+            vals = [str(ln.get("multipv", i + 1)),
+                    ln.get("score", "—"),
+                    ln.get("winrate", "—"),
+                    str(ln.get("depth") or "—"),
+                    ln.get("chinese_seq", ""),
+                    ln.get("pv_iccs", "")]
+            for j, v in enumerate(vals):
+                item = QTableWidgetItem(str(v))
+                if i == 0:
+                    item.setForeground(QColor(60, 230, 110))
+                if j >= 4:
+                    item.setToolTip(str(v))
+                self.table.setItem(i, j, item)
+
+    def _apply_diag(self, fen: str, diag: dict, with_status: bool = False) -> None:
+        """把 diag 渲染到右栏标签与主变例表。"""
+        if fen:
+            self.lbl_fen.setText(fen)
+        side_cn = "红方走" if diag.get("side") == "w" else "黑方走"
+        self.lbl_best.setText(
+            f"{diag.get('best') or '—'}   {diag.get('chinese', '')}")
+        self.lbl_winrate.setText(diag.get("winrate", "—"))
+
+        sub = (f"{side_cn} · 分数 {diag.get('score', '—')} · "
+               f"深度 {diag.get('depth') or '—'}")
+        if diag.get("seldepth"):
+            sub += f"/{diag['seldepth']}"
+        sub += f" · 合法着法 {diag.get('moves', 0)}"
+        if diag.get("nps"):
+            sub += f" · {diag['nps'] / 1e6:.2f}M nps"
+        if diag.get("engine_mode"):
+            sub += f" · {diag['engine_mode']}"
+        self.lbl_best_sub.setText(sub)
+
+        if diag.get("note"):
+            self.lbl_side_note.setText(diag["note"])
+            self.lbl_side_note.show()
+        else:
+            self.lbl_side_note.hide()
+
+        if with_status:
+            self.statusBar().showMessage(
+                f"识别 {diag.get('t_recog', 0):.0f}ms · "
+                f"最低置信 {diag.get('conf', 0):.2f} · {diag.get('guard', '')}")
+        self._fill_pv_table(diag)
 
     # ---------------- 窗口列表 ----------------
     def refresh_windows(self) -> None:
@@ -757,10 +1389,21 @@ class MainWindow(QMainWindow):
         self.worker.confirm = self.spin_conf.value()
         self.worker.first_side = self.combo_side.currentData() or "w"
         self.worker.my_side = self.combo_my_side.currentData() or "w"
+        # 引擎参数（可调）
+        params = self._collect_engine_params()
+        self.worker.threads = params["threads"]
+        self.worker.hash_mb = params["hash_mb"]
+        self.worker.multipv = params["multipv"]
+        self.worker.move_overhead = params["move_overhead"]
+        self.worker.show_wdl = params["show_wdl"]
+        self.worker.infinite = params["infinite"]
+        self.worker.engine_opts = params["advanced"]
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.frame_ready.connect(self.on_frame)
+        self.worker.analysis_update.connect(self.on_analysis_update)
+        self.worker.engine_options.connect(self.on_engine_options)
         self.worker.status.connect(self.statusBar().showMessage)
         self.worker.error.connect(lambda m: self.statusBar().showMessage(f"错误: {m}"))
         self.worker.done.connect(self.on_done)
@@ -788,31 +1431,13 @@ class MainWindow(QMainWindow):
         # 棋盘 + 走法箭头（最佳着法画绿色粗箭头，候选着法画蓝色细箭头）
         # 箭头坐标会由 BoardView 依据 flipped 做 180° 映射，以贴合画面朝向
         self.board.update_board(warped, rows, diag.get("arrow"), alts, flipped)
-        self.lbl_fen.setText(fen)
+        self._apply_diag(fen, diag, with_status=True)
 
-        side_cn = "红方走" if diag.get("side") == "w" else "黑方走"
-        self.lbl_best.setText(f"{diag.get('best', '—')}   {diag.get('chinese', '')}")
-        self.lbl_winrate.setText(diag.get("winrate", "—"))
-        # 技术指标挪到副行与状态栏，避免干扰主要信息
-        self.lbl_best_sub.setText(
-            f"{side_cn} · 分数 {diag.get('score')} · 深度 {diag.get('depth')} · "
-            f"合法着法 {diag.get('moves', 0)}")
-        self.statusBar().showMessage(
-            f"识别 {diag.get('t_recog', 0):.0f}ms · "
-            f"最低置信 {diag.get('conf', 0):.2f} · {diag.get('guard', '')}")
-        if diag.get("note"):
-            self.lbl_side_note.setText(diag["note"])
-            self.lbl_side_note.show()
-        else:
-            self.lbl_side_note.hide()
-
-        self.table.setRowCount(len(alts))
-        for i, a in enumerate(alts):
-            for j, v in enumerate([a["iccs"], a["chinese"], a["score"], a["depth"]]):
-                item = QTableWidgetItem(str(v))
-                if i == 0:
-                    item.setForeground(QColor(60, 230, 110))
-                self.table.setItem(i, j, item)
+    @Slot(str, dict)
+    def on_analysis_update(self, fen: str, diag: dict) -> None:
+        """引擎持续加深时的流式刷新：只更新箭头与右栏，不重传棋盘图像。"""
+        self.board.set_arrows(diag.get("arrow"), diag.get("alts") or [])
+        self._apply_diag(fen, diag, with_status=False)
 
     @Slot()
     def on_done(self) -> None:
@@ -834,6 +1459,9 @@ class MainWindow(QMainWindow):
         if self.thread:
             self.thread.quit()
             self.thread.wait(3000)
+        # 线程已停，再确保引擎子进程被关掉（否则会留下孤儿进程）
+        if self.worker:
+            self.worker.shutdown()
         ev.accept()
 
 
