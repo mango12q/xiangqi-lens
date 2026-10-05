@@ -23,7 +23,7 @@ import numpy as np
 
 # 版本号：同时用于窗口标题、运行日志与打包产物命名，
 # 便于用户确认自己用的是哪一版。
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 HERE = Path(__file__).resolve().parent
 
@@ -305,23 +305,277 @@ def list_windows_any(min_size: int = 200):
     return out
 
 
-def create_engine(threads: int = 8, hash_mb: int = 256):
+def create_engine(threads: int = 8, hash_mb: int = 256,
+                  options: dict | None = None):
+    """启动 Pikafish 并下发基础选项。
+
+    ``options`` 是额外的 UCI 选项字典（{name: value}），在基础项之后下发，
+    用于「高级」面板里用户手改的参数；下发失败不致命。
+    """
     from engine_client import UciEngine
     eng = UciEngine(str(ENGINE_EXE), name="pikafish")
     eng.set_option("Threads", threads)
     eng.set_option("Hash", hash_mb)
     # 让引擎在 info 行里带上 wdl（胜/和/负概率），用于显示人类可读的胜率。
-    # 实测支持：开启后 info 行会多出 " wdl 72 917 11" 这样的字段。
+    # ★ 只认小写 "true"：写 Python 的 True 会拼成 "value True" 被引擎忽略
+    #   （实测 0 条 info 行带 wdl），历史上这行一直没生效。
     try:
-        eng.set_option("UCI_ShowWDL", True)
+        eng.set_option("UCI_ShowWDL", "true")
     except Exception:
         pass
+    apply_engine_options(eng, options)
     eng.isready()
     return eng
 
 
+# ---------------------------------------------------------------------------
+# UCI 选项：解析 / 下发 / 清空哈希
+# ---------------------------------------------------------------------------
+def parse_engine_options(option_lines: list[str]) -> list[dict]:
+    """把 ``UciEngine.option_lines`` 解析成结构化选项列表。
+
+    返回 ``[{'name','type','default','min','max','var':[...]}]``，供 UI 按
+    ``type``（spin / check / combo / button / string）动态生成控件。
+    解析逻辑与 ``src/engine.py::_parse_option`` 一致，遵循 UCI 规范：
+
+        option name Threads type spin default 1 min 1 max 1024
+        option name UCI_ShowWDL type check default false
+        option name Clear Hash type button
+    """
+    out: list[dict] = []
+    for text in option_lines:
+        text = (text or "").strip()
+        if not text.startswith("option name "):
+            continue
+        rest = text[len("option name "):]
+        type_idx = rest.find(" type ")
+        if type_idx < 0:
+            continue
+        name = rest[:type_idx].strip()
+        parts = rest[type_idx + len(" type "):].split()
+        if not parts:
+            continue
+        opt = {"name": name, "type": parts[0].lower(),
+               "default": "", "min": None, "max": None, "var": []}
+        i = 1
+        while i < len(parts):
+            key = parts[i]
+            if key == "default" and i + 1 < len(parts):
+                opt["default"] = parts[i + 1]
+                i += 2
+            elif key == "min" and i + 1 < len(parts):
+                try:
+                    opt["min"] = int(parts[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif key == "max" and i + 1 < len(parts):
+                try:
+                    opt["max"] = int(parts[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif key == "var" and i + 1 < len(parts):
+                opt["var"].append(parts[i + 1])
+                i += 2
+            else:
+                i += 1
+        out.append(opt)
+    return out
+
+
+def set_engine_option(eng, name: str, value) -> None:
+    """下发单个 UCI 选项（bool → 'true'/'false'）。"""
+    if isinstance(value, bool):
+        value = "true" if value else "false"
+    eng.set_option(name, value)
+
+
+def apply_engine_options(eng, opts: dict | None) -> None:
+    """批量下发 UCI 选项；单个失败不影响其余。"""
+    if not opts:
+        return
+    for name, value in opts.items():
+        try:
+            set_engine_option(eng, name, value)
+        except Exception:
+            pass
+
+
+def clear_hash(eng) -> None:
+    """清空置换表。
+
+    ``Clear Hash`` 是 button 型选项，不能带 ``value``，而
+    ``UciEngine.set_option`` 会强制拼上 " value"，所以必须直接 ``send``。
+    """
+    try:
+        eng.send("setoption name Clear Hash")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# info 行解析：真正的 MultiPV
+# ---------------------------------------------------------------------------
+def _to_int(s, default: int = 0) -> int:
+    try:
+        return int(s)
+    except Exception:
+        return default
+
+
+def parse_info_line(line: str) -> dict | None:
+    """解析单条 ``info ...`` 行。
+
+    返回 ``{'depth','seldepth','multipv','score_cp','score_mate','wdl',
+    'nodes','nps','hashfull','time_ms','pv':[...]}``；非 info 行返回 None。
+
+    分数统一到 ``score_cp``：mate N 归一化为 ``30000 - |N|*100``，与
+    ``format_score`` 的绝杀判定保持同一量纲（原 ``parse_alternatives`` 同款）。
+    """
+    if not line.startswith("info"):
+        return None
+    parts = line.split()
+    info = {"depth": None, "seldepth": None, "multipv": 1,
+            "score_cp": None, "score_mate": None, "wdl": None,
+            "nodes": None, "nps": None, "hashfull": None,
+            "time_ms": None, "pv": [], "bound": None}
+    i, n = 1, len(parts)
+    while i < n:
+        key = parts[i]
+        if key == "depth" and i + 1 < n:
+            info["depth"] = _to_int(parts[i + 1]); i += 2
+        elif key == "seldepth" and i + 1 < n:
+            info["seldepth"] = _to_int(parts[i + 1]); i += 2
+        elif key == "multipv" and i + 1 < n:
+            info["multipv"] = _to_int(parts[i + 1], 1) or 1; i += 2
+        elif key == "score" and i + 2 < n:
+            kind, val = parts[i + 1], _to_int(parts[i + 2])
+            if kind == "cp":
+                info["score_cp"] = val
+            elif kind == "mate":
+                info["score_mate"] = val
+            i += 3
+            if i < n and parts[i] in ("lowerbound", "upperbound"):
+                info["bound"] = parts[i]     # 边界行，pv 是截断的中间结果
+                i += 1
+        elif key == "wdl" and i + 3 < n:
+            try:
+                info["wdl"] = (int(parts[i + 1]), int(parts[i + 2]), int(parts[i + 3]))
+            except ValueError:
+                pass
+            i += 4
+        elif key == "nodes" and i + 1 < n:
+            info["nodes"] = _to_int(parts[i + 1]); i += 2
+        elif key == "nps" and i + 1 < n:
+            info["nps"] = _to_int(parts[i + 1]); i += 2
+        elif key == "hashfull" and i + 1 < n:
+            info["hashfull"] = _to_int(parts[i + 1]); i += 2
+        elif key == "time" and i + 1 < n:
+            info["time_ms"] = _to_int(parts[i + 1]); i += 2
+        elif key == "pv":
+            info["pv"] = parts[i + 1:]
+            break
+        else:
+            i += 1
+    if info["score_cp"] is None and info["score_mate"] is not None:
+        info["score_cp"] = 30000 - abs(info["score_mate"]) * 100
+    return info
+
+
+class MultiPVBuffer:
+    """跨多次 drain 累积引擎 info 行，按 multipv 序号保留最新（最深）的一条。
+
+    引擎在 ``go infinite`` 下会持续输出同一个 ``multipv`` 序号但深度递增的
+    行，这里「后到覆盖先到」即得到当前最新主变例。
+    """
+
+    def __init__(self) -> None:
+        self._by: dict[int, dict] = {}
+
+    def feed(self, lines: list[str]) -> None:
+        for line in lines:
+            info = parse_info_line(line)
+            # 只收带 pv 的行，滤掉 "info currmove ..." 之类的中间行；
+            # 同时跳过 lowerbound/upperbound 行——这类行的 pv 是被截断的
+            # 中间结果，覆盖上去会把一条完整主变例换成两三步的残段。
+            if info is None or not info.get("pv") or info.get("bound"):
+                continue
+            k = int(info.get("multipv") or 1)
+            self._by[k] = info
+
+    def snapshot(self, maxpv: int = 0) -> list[dict]:
+        """按 multipv 升序返回；``maxpv>0`` 时过滤掉超出当前档位的陈旧序号。"""
+        keys = sorted(self._by)
+        if maxpv > 0:
+            keys = [k for k in keys if k <= maxpv]
+        return [self._by[k] for k in keys]
+
+    def clear(self) -> None:
+        self._by.clear()
+
+    def __len__(self) -> int:
+        return len(self._by)
+
+
+def pv_to_chinese(fen: str, pv: list[str], limit: int = 0) -> list[str]:
+    """用 cchess 逐着回放整条主变例，返回每一步的中文记谱。
+
+    注意：cchess 的 ``move_player`` **不会自动换边**（``move()`` 会校验行棋方，
+    见 cchess/board.py:243），所以每落一子必须 ``next_turn()``，否则从第二步
+    起会被判非法而中断。遇到 cchess 不认可的着法（长将/长捉规则差异）即截断。
+    """
+    if not pv:
+        return []
+    try:
+        from cchess import ChessBoard
+    except Exception:
+        return []
+    try:
+        b = ChessBoard(fen)
+    except Exception:
+        return []
+    out: list[str] = []
+    for mv in pv:
+        try:
+            m = b.move_iccs(mv)
+        except Exception:
+            break
+        if m is None:
+            break
+        try:
+            out.append(m.to_text())
+        except Exception:
+            out.append(mv)
+        b.next_turn()
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def short_winrate(wdl: tuple[int, int, int] | None, cp: int | None,
+                  my_side: str = "w") -> str:
+    """给 PV 表用的紧凑胜率，如 ``'62%'``（视角与 ``format_winrate`` 一致）。"""
+    if wdl is not None:
+        w, d, l = wdl
+        total = max(1, w + d + l)
+        red = w * 100.0 / total
+        mine = red if my_side == "w" else (l * 100.0 / total)
+        return f"{mine:.0f}%"
+    p = winrate_from_cp(cp)
+    if p is None:
+        return "—"
+    mine = p if my_side == "w" else (100.0 - p)
+    return f"{mine:.0f}%"
+
+
 def parse_wdl(line: str) -> tuple[int, int, int] | None:
-    """从一行 info 里解析 wdl（胜/和/负，千分比，红方视角）。"""
+    """从一行 info 里解析 wdl（胜/和/负，千分比）。
+
+    注意：引擎给出的 wdl 是**行棋方视角**（实测：红方多一车时，红走
+    wdl=(1000,0,0)、黑走 wdl=(0,0,1000)），要按红方视角使用必须先过
+    :func:`wdl_to_red`。
+    """
     if " wdl " not in line:
         return None
     try:
@@ -330,6 +584,19 @@ def parse_wdl(line: str) -> tuple[int, int, int] | None:
         return w, d, l
     except Exception:
         return None
+
+
+def wdl_to_red(wdl: tuple[int, int, int] | None,
+               side_to_move: str = "w") -> tuple[int, int, int] | None:
+    """把引擎的 wdl（行棋方视角）转成红方视角 (win, draw, loss)。
+
+    ``format_winrate`` / ``short_winrate`` 都按红方视角解释 wdl，因此调用前
+    必须先按行棋方翻转，否则黑方走子时胜率会整个反过来。
+    """
+    if wdl is None:
+        return None
+    w, d, l = wdl
+    return (w, d, l) if side_to_move == "w" else (l, d, w)
 
 
 def winrate_from_cp(cp: int | None) -> float | None:
