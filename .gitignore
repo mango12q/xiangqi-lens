@@ -73,8 +73,11 @@ desktop.ini
 *.log
 *.tmp
 
-# ������ﱸ��
+# 打包产物备份
 _build_ok/
 
 # 工作区本地数据（AI 记忆 / 运行日志，不入库）
 .workbuddy-ai/
+
+# automove local config (per-user auto-move settings, not committed)
+automove.json

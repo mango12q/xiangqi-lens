@@ -23,7 +23,7 @@ import numpy as np
 
 # 版本号：同时用于窗口标题、运行日志与打包产物命名，
 # 便于用户确认自己用的是哪一版。
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 HERE = Path(__file__).resolve().parent
 
@@ -113,6 +113,10 @@ class ScreenSource:
     def __init__(self) -> None:
         self.hwnd: int | None = None
         self.title = ""
+        # 抓帧时的窗口矩形 (l, t, r, b)。截图坐标 + 该原点 = 屏幕物理坐标，
+        # 自动走棋点击时靠它把 ``src_*`` 换算成屏幕坐标。**必须与返回的那
+        # 一帧对齐**，否则窗口移动后会用陈旧坐标点到别处。
+        self.rect: tuple[int, int, int, int] | None = None
         self.stats = {"background": 0, "foreground": 0, "failed": 0}
 
     @staticmethod
@@ -160,6 +164,7 @@ class ScreenSource:
             self.stats["foreground"] += 1
             return img
         self.stats["failed"] += 1
+        self.rect = None          # 两路都失败：清掉，避免陈旧矩形被点击逻辑误用
         return None
 
     def _print_window(self) -> np.ndarray | None:
@@ -194,6 +199,7 @@ class ScreenSource:
             if buf.size < bw * bh * 4:
                 return None
             arr = buf[: bw * bh * 4].reshape(bh, bw, 4)
+            self.rect = (l, t, r, b)                        # 与返回帧对齐
             return np.ascontiguousarray(arr[:, :, :3])      # BGRA -> BGR
         except Exception:
             return None
@@ -231,6 +237,7 @@ class ScreenSource:
                 shot = m.grab({"left": l, "top": t, "width": w, "height": h})
                 arr = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(
                     shot.height, shot.width, 4)
+                self.rect = (l, t, r, b)                    # 与返回帧对齐
                 return np.ascontiguousarray(arr[:, :, :3])
         except Exception:
             return None
@@ -555,7 +562,11 @@ def pv_to_chinese(fen: str, pv: list[str], limit: int = 0) -> list[str]:
 
 def short_winrate(wdl: tuple[int, int, int] | None, cp: int | None,
                   my_side: str = "w") -> str:
-    """给 PV 表用的紧凑胜率，如 ``'62%'``（视角与 ``format_winrate`` 一致）。"""
+    """给 PV 表用的紧凑胜率，如 ``'62%'``。
+
+    **视角是「我方」**（按 ``my_side`` 换算）—— 与「当前建议」栏的
+    :func:`format_winrate` 不同，后者已改为红/黑方绝对视角。
+    """
     if wdl is not None:
         w, d, l = wdl
         total = max(1, w + d + l)
@@ -625,42 +636,52 @@ def winrate_from_cp(cp: int | None) -> float | None:
         return None
 
 
+# 优势判定阈值：红/黑胜率相差 ≥ 该百分点才认为一方占优，否则算均势。
+WINRATE_EDGE = 10.0
+
+
+def _winrate_sentence(red: float, black: float, est: bool = False) -> str:
+    """按红/黑方胜率拼一句「只报占优方」的评估。
+
+    * 红方占优 → ``红方优势，红方胜率约 62%``
+    * 黑方占优 → ``黑方优势，黑方胜率约 58%``
+    * 均势     → ``均势（红 50% / 黑 48%）``
+
+    ``est=True`` 表示胜率来自 cp 经验估算（引擎未给 wdl），会附上标记。
+    """
+    tail = "（估算）" if est else ""
+    if red - black >= WINRATE_EDGE:
+        return f"红方优势，红方胜率约 {red:.0f}%{tail}"
+    if black - red >= WINRATE_EDGE:
+        return f"黑方优势，黑方胜率约 {black:.0f}%{tail}"
+    inner = f"红 {red:.0f}% / 黑 {black:.0f}%" + ("，估算" if est else "")
+    return f"均势（{inner}）"
+
+
 def format_winrate(wdl: tuple[int, int, int] | None, cp: int | None,
                    my_side: str = "w") -> str:
-    """把 wdl 或 cp 转成一句人类可读的局面评估。
+    """把 wdl 或 cp 转成一句人类可读的局面评估 —— **只报占优的一方**。
 
-    ``wdl`` 是引擎给的（红方视角，千分比）。这里按「我方」视角换算，
-    这样执黑时看到的是自己的胜率而不是红方的。
+    输出以红/黑方**绝对视角**表述（不再用「我方/对方」），例如
+    ``红方优势，红方胜率约 62%``；差距不足 :data:`WINRATE_EDGE` 时给
+    ``均势（红 50% / 黑 48%）``。
+
+    ``wdl`` 是引擎给的（红方视角，千分比；调用前须过 :func:`wdl_to_red`）。
+
+    注意：``my_side`` 参数仅为兼容旧调用保留，**不再影响输出** ——
+    历史版本按「我方视角」换算胜率，现在一律按红/黑方表述。
     """
     if wdl is not None:
-        w, d, l = wdl
-        total = max(1, w + d + l)
-        red = w * 100.0 / total          # 红方胜率
-        draw = d * 100.0 / total
-        mine = red if my_side == "w" else (l * 100.0 / total)
-        theirs = (l * 100.0 / total) if my_side == "w" else red
-        if draw >= 55:
-            shape = "和棋倾向"
-        elif abs(mine - theirs) >= 25:
-            shape = "我方大优" if mine > theirs else "我方劣势"
-        elif abs(mine - theirs) >= 10:
-            shape = "我方稍优" if mine > theirs else "我方稍亏"
-        else:
-            shape = "均势"
-        return (f"我方胜率 {mine:.0f}% · 和 {draw:.0f}% · 对方 {theirs:.0f}%  "
-                f"（{shape}）")
+        w, _d, l = wdl
+        total = max(1, w + _d + l)
+        red = w * 100.0 / total
+        black = l * 100.0 / total
+        return _winrate_sentence(red, black)
 
     p = winrate_from_cp(cp)
     if p is None:
         return "—"
-    mine = p if my_side == "w" else (100.0 - p)
-    if abs(mine - 50) >= 25:
-        shape = "我方大优" if mine > 50 else "我方劣势"
-    elif abs(mine - 50) >= 10:
-        shape = "我方稍优" if mine > 50 else "我方稍亏"
-    else:
-        shape = "均势"
-    return f"我方胜率 {mine:.0f}%（{shape}，估算）"
+    return _winrate_sentence(p, 100.0 - p, est=True)
 
 
 def validate_fen(fen: str) -> tuple[bool, str, int]:
@@ -1111,6 +1132,36 @@ def move_arrow(warp_mat, move: str,
         return out
     except Exception:
         return None
+
+
+def move_screen_points(rect, warp_mat, move: str) -> dict | None:
+    """把 ICCS 着法换算成**屏幕物理坐标**点对，供自动走棋点击。
+
+    与 ``move_arrow`` 的关系：后者给出 ``src_from``/``src_to``（原截图坐标），
+    本函数再叠加抓帧时窗口矩形的原点 ``(l, t)`` 即得屏幕坐标。
+
+    ``rect`` 为 ``ScreenSource.rect``（抓帧时缓存，与该帧对齐），
+    ``warp_mat`` 为该帧透视矩阵。任一缺失或点越出窗口矩形都返回 None。
+
+    返回::
+
+        {"from": (sx, sy), "to": (sx, sy)}
+    """
+    if rect is None or warp_mat is None:
+        return None
+    arrow = move_arrow(warp_mat, move)
+    if not arrow or not arrow.get("src_from") or not arrow.get("src_to"):
+        return None
+    l, t, r, b = rect
+    out: dict[str, tuple[float, float]] = {}
+    for key, skey in (("from", "src_from"), ("to", "src_to")):
+        sx, sy = arrow[skey]
+        x, y = l + float(sx), t + float(sy)
+        # 越界保护：点击点必须落在窗口矩形内（留 2px 容差）
+        if not (l - 2 <= x <= r + 2 and t - 2 <= y <= b + 2):
+            return None
+        out[key] = (x, y)
+    return out
 
 
 # ---------------------------------------------------------------------------

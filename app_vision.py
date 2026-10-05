@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """XiangQiLens GUI —— 界面与调度层（识别/引擎逻辑见 app_backend.py）。
 
-不含自动点击：只给走法建议，落子由用户自行操作。
+默认只给走法建议，落子由用户自行操作；可选「自动走棋」（默认关闭 +
+预览模式）会模拟鼠标点击替我方落子 —— 见 Worker._pump_auto_move 与
+app_input.MouseClicker。
 """
 from __future__ import annotations
 
 import argparse
+import json
 import queue
 import sys
 import time
@@ -30,22 +33,26 @@ except OSError:
 sys.path.insert(0, str(HERE))
 
 from app_backend import (HERE as BACKEND_DIR, MultiPVBuffer, ScreenSource,
-                         __version__, apply_engine_options, check_board_geometry,
-                         check_position, clear_hash, create_engine, create_vision,
-                         enable_dpi_awareness, fen_with_side, format_score,
-                         format_winrate, list_windows_any, move_arrow,
+                         __version__, app_base, apply_engine_options,
+                         check_board_geometry, check_position, clear_hash,
+                         create_engine, create_vision, enable_dpi_awareness,
+                         fen_with_side, format_score, format_winrate,
+                         list_windows_any, move_arrow, move_screen_points,
                          move_to_chinese, parse_engine_options, pv_to_chinese,
                          selftest, short_winrate, validate_fen, wdl_to_red,
                          window_state)
 
-from PySide6.QtCore import QObject, QRect, QThread, Qt, Signal, Slot
+from app_input import MouseClicker, ensure_foreground, is_point_on_window
+
+from PySide6.QtCore import QObject, QRect, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFormLayout,
-                               QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
-                               QLabel, QLineEdit, QMainWindow, QMessageBox,
-                               QPushButton, QScrollArea, QSpinBox, QSplitter,
-                               QStatusBar, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
+                               QDoubleSpinBox, QFormLayout, QGridLayout,
+                               QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+                               QLineEdit, QMainWindow, QMessageBox, QPushButton,
+                               QScrollArea, QSpinBox, QSplitter, QStatusBar,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout,
+                               QWidget)
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +69,10 @@ class Worker(QObject):
     analysis_update = Signal(str, dict)
     # 引擎握手时声明的可调选项，用于动态构建「高级」面板。
     engine_options = Signal(list)
+    # 自动走棋开关变化（驱动主界面的「运行中」指示）
+    auto_state_changed = Signal(bool)
+    # 自动走棋每次动作的预览/执行信息 {best, chinese, from, to, dry}
+    auto_preview = Signal(dict)
 
     def __init__(self, source: ScreenSource) -> None:
         super().__init__()
@@ -78,10 +89,11 @@ class Worker(QObject):
         self.engine_opts: dict = {}    # 「高级」面板里手改的选项 {name: value}
         # first_side：首帧轮次（红先/黑先），只影响"该谁走"
         self.first_side = "w"
-        # my_side：我方执子方（红/黑）。**只影响两处呈现**：胜率视角
-        # （format_winrate）与左栏显示图的朝向。矩阵/FEN 永远是标准朝向，
-        # 因为识别模型的拉正流程已按内容把黑方底线摆到 row 0（见 run() 里的注释）。
-        # 这是与 first_side 完全独立的一维。
+        # my_side：我方执子方（红/黑）。**只影响左栏显示图的朝向**
+        # （执黑时把显示图转 180°，让我方在下）；「当前建议」栏的胜率已改为
+        # 红/黑方绝对视角表述（见 format_winrate），不再随本项变化。
+        # 矩阵/FEN 永远是标准朝向，因为识别模型的拉正流程已按内容把黑方底线
+        # 摆到 row 0（见 run() 里的注释）。这是与 first_side 完全独立的一维。
         self.my_side = "w"
         self._run = False
         self._vision = None
@@ -104,6 +116,30 @@ class Worker(QObject):
         self._last_emit = 0.0          # analysis_update 节流时间戳
         self._last_rebuild = 0.0       # 引擎重建重试节流时间戳
         self._cn_cache: dict = {}      # (fen, pv) → 中文序列，避免重复回放
+        # ---- 自动走棋（模拟鼠标点击落子，仅走我方）----
+        # 可调项（经 _cmds 队列下发，见 post_auto / apply_auto_params）
+        self.auto_move_enabled = False  # 总开关（默认关）
+        self.auto_think_ms = 1200       # 自动走棋专用思考时间（强制有限搜索）
+        self.auto_dry_run = True        # 预览模式：只算不点（默认开，安全）
+        self.auto_click_mode = "two_click"   # "two_click" | "drag"
+        self.auto_cooldown = 1.5        # 两次落子最小间隔 s
+        self.auto_max_moves = 200       # 连续走子保险丝
+        self.auto_place_wait = 2.5      # 落子后等待棋盘更新的超时 s
+        self.auto_retry_max = 3         # 点击未生效的最大重试次数
+        self.auto_restore_cursor = False
+        self.auto_move_steps = 1        # 光标移动插值步数（1=直跳）
+        # 运行时状态
+        self._clicker = None            # MouseClicker（首次真点时惰性创建）
+        self._last_bestmove = ""        # 最近一次 bestmove（ICCS）
+        self._last_bestmove_fen = ""    # 该 bestmove 对应的 FEN
+        self._auto_done: tuple = ("", "")   # 已处理过的 (fen, best)，防重复
+        self._auto_pending = None       # (fen, best, t_click) 等待棋盘更新
+        self._auto_retries = 0
+        self._auto_next_click_t = 0.0
+        self._auto_last_click_t = 0.0
+        self._auto_moves_made = 0
+        self._cur_rows: list[str] | None = None   # 当前已采信矩阵（校验起点棋子）
+        self._auto_preview: dict = {}   # 最近一次预览/落子信息（给 UI）
         # 主线程 → Worker 的参数变更命令队列。
         # 不能用 Qt 信号：run() 是个长驻阻塞循环，永远不会把控制权交回该线程
         # 的事件循环，queued 连接的槽函数根本不会被派发。
@@ -226,6 +262,9 @@ class Worker(QObject):
             # continue 分支会跳过循环末尾）。
             self._process_commands()
             self._pump_engine()
+            # 自动走棋：拿到确定 bestmove 且轮到我方时点击落子。
+            # 放在 _pump_engine 之后、其余 continue 分支之前，保证每轮都评估一次。
+            self._pump_auto_move()
 
             # 先查窗口状态：最小化时截图拿不到棋盘，必须明确告知用户，
             # 否则只会表现为"局面不合法"，让人摸不着头脑。
@@ -333,6 +372,7 @@ class Worker(QObject):
             # 暂存本帧识别上下文；diag 由 _build_diag 从引擎 PV 快照组装
             self._cur_fen_base, self._cur_side = fen_base, side
             self._cur_warp_mat = res["warp_mat"]
+            self._cur_rows = rows
             self._cur_ctx = {
                 "t_recog": t_recog,
                 "conf": float(res["conf"].min()),
@@ -431,7 +471,11 @@ class Worker(QObject):
         self._search_fen = fen
         eng.drain()
         eng.send(f"position fen {fen}")
-        if self.infinite:
+        if self.auto_move_enabled:
+            # 自动走棋必须等一个确定的 bestmove 才能落子，而 go infinite 永不
+            # 返回 bestmove —— 所以开启自动走棋时强制有限搜索（"持续加深"置灰）。
+            eng.send(f"go movetime {int(self.auto_think_ms)}")
+        elif self.infinite:
             eng.send("go infinite")
         else:
             eng.send(f"go movetime {int(self.movetime)}")
@@ -540,6 +584,11 @@ class Worker(QObject):
                 parts = ln.split()
                 best = parts[1] if len(parts) > 1 else None
                 self._searching = False
+        # 记录本次 bestmove 及其所属局面，供自动走棋取用（_pump_auto_move）。
+        # 必须在下面任何 return 之前记录，否则 movetime 结束的那一轮会被漏掉。
+        if best:
+            self._last_bestmove = best
+            self._last_bestmove_fen = self._search_fen
 
         infos = [ln for ln in lines if ln.startswith("info")]
         if infos:
@@ -662,6 +711,214 @@ class Worker(QObject):
             "guard": self._tracker.stats if self._tracker is not None else "",
         }
 
+    # ---- 自动走棋（模拟鼠标点击落子）----
+    def _from_is_my_piece(self, iccs: str) -> bool:
+        """起点格必须是我方棋子 —— 防止轮次误判时动到对方的子。"""
+        try:
+            if not self._cur_rows or len(iccs) < 2:
+                return False
+            col = ord(iccs[0].lower()) - ord("a")
+            row = 9 - int(iccs[1])
+            if not (0 <= row <= 9 and 0 <= col <= 8):
+                return False
+            p = self._cur_rows[row][col]
+            if p in (".", "x"):
+                return False
+            return p.isupper() if self.my_side == "w" else p.islower()
+        except Exception:
+            return False
+
+    def _disable_auto_move(self, reason: str = "") -> None:
+        """关闭自动走棋并通知 UI（不终止识别线程）。"""
+        self.auto_move_enabled = False
+        self._auto_pending = None
+        if reason:
+            self._log(f"自动走棋已停止: {reason}")
+        try:
+            self.auto_state_changed.emit(False)
+        except Exception:
+            pass
+
+    def _pump_auto_move(self) -> None:
+        """每轮循环调用：轮到我方且拿到确定 bestmove 时，模拟鼠标点击落子。
+
+        所有闸门不满足就静默返回；只有全部通过才会真正点击。
+        """
+        if not self.auto_move_enabled:
+            return
+        now = time.perf_counter()
+
+        # ---- 1) 上一次点击的生效判定 / 超时重试 ----
+        if self._auto_pending is not None:
+            pfen, pbest, _t = self._auto_pending
+            if self._cur_fen_base and self._cur_fen_base != pfen:
+                # 棋盘已更新 → 上次点击生效
+                self._auto_pending = None
+                self._auto_retries = 0
+                self._auto_moves_made += 1
+                self._log(f"自动走棋已生效（累计 {self._auto_moves_made} 手）")
+                return
+            if now < self._auto_next_click_t:
+                return
+            if self._auto_retries >= self.auto_retry_max:
+                self.status.emit("自动走棋未生效，已暂停（请检查坐标/遮挡）")
+                self._disable_auto_move("多次点击未生效")
+                return
+            self._auto_retries += 1
+            self._auto_next_click_t = now + self.auto_place_wait
+            self._log(f"自动走棋重试第 {self._auto_retries} 次")
+            self._do_auto_click(pfen, pbest)
+            return
+
+        # ---- 2) 触发闸门 ----
+        best = self._last_bestmove
+        fen = self._last_bestmove_fen
+        if not best or best in ("(none)", "0000"):
+            return
+        if self._searching:
+            return                                  # 搜索未结束，bestmove 未定
+        if not fen or not self._cur_fen_base:
+            return
+        if fen != fen_with_side(self._cur_fen_base, self._cur_side):
+            return                                  # bestmove 属于旧局面
+        if self._cur_side != self.my_side:
+            return                                  # ★ 只走我方
+        if (fen, best) == self._auto_done:
+            return                                  # 同局面同着法只点一次
+        if now - self._auto_last_click_t < self.auto_cooldown:
+            return
+        if self._auto_moves_made >= self.auto_max_moves:
+            self.status.emit("自动走棋已达最大连续走子数，已停止")
+            self._disable_auto_move("达到最大连续走子数")
+            return
+        if not self._from_is_my_piece(best):
+            return
+        if self.source.hwnd:
+            ok, minimized, _ = window_state(self.source.hwnd)
+            if not ok or minimized:
+                return
+
+        self._do_auto_click(fen, best)
+
+    def _do_auto_click(self, fen: str, best: str) -> None:
+        """把 bestmove 换算成屏幕坐标并执行点击（或预览）。"""
+        hwnd = self.source.hwnd
+        if not hwnd:
+            return
+        cap = self.source.rect
+        if cap is None:
+            return
+        # 陈旧坐标防护：窗口在抓帧后被移动/缩放 → warp_mat 失效，放弃本次
+        try:
+            import win32gui
+            cur = win32gui.GetWindowRect(hwnd)
+        except Exception:
+            return
+        if (cur[2] - cur[0], cur[3] - cur[1]) != (cap[2] - cap[0], cap[3] - cap[1]):
+            self._log("窗口尺寸已变化，放弃本次自动走棋")
+            return
+        if abs(cur[0] - cap[0]) > 4 or abs(cur[1] - cap[1]) > 4:
+            self._log("窗口已移动，放弃本次自动走棋")
+            return
+
+        pts = move_screen_points(cap, self._cur_warp_mat, best)
+        if not pts:
+            self._log(f"自动走棋坐标换算失败: {best}")
+            return
+        chinese = move_to_chinese(fen, best)
+        self._auto_preview = {"best": best, "chinese": chinese,
+                              "from": pts["from"], "to": pts["to"],
+                              "dry": bool(self.auto_dry_run)}
+
+        if self.auto_dry_run:
+            self._auto_done = (fen, best)
+            self._auto_last_click_t = time.perf_counter()
+            try:
+                self.auto_preview.emit(self._auto_preview)
+            except Exception:
+                pass
+            self.status.emit(f"[预览] 自动走棋将点击 {chinese}（{best}）"
+                             f" {pts['from']} → {pts['to']}")
+            return
+
+        if self._clicker is None:
+            self._clicker = MouseClicker(mode=self.auto_click_mode,
+                                         move_steps=self.auto_move_steps,
+                                         restore_cursor=self.auto_restore_cursor)
+        # 硬闸门：目标窗口必须在前台，且两个落点都在该窗口上
+        if not ensure_foreground(hwnd):
+            self.status.emit("无法将目标窗口置前，跳过本次自动走棋")
+            self._log("ensure_foreground 失败，跳过")
+            return
+        if not (is_point_on_window(hwnd, *pts["from"])
+                and is_point_on_window(hwnd, *pts["to"])):
+            self.status.emit("点击点被其他窗口遮挡，跳过本次自动走棋")
+            self._log("点击点被遮挡，跳过")
+            return
+
+        try:
+            self._clicker.place_move(pts["from"], pts["to"])
+        except Exception as exc:
+            self.error.emit(f"自动点击失败: {exc}")
+            return
+
+        self._auto_done = (fen, best)
+        self._auto_last_click_t = time.perf_counter()
+        self._auto_pending = (fen, best, self._auto_last_click_t)
+        self._auto_next_click_t = self._auto_last_click_t + self.auto_place_wait
+        try:
+            self.auto_preview.emit(self._auto_preview)
+        except Exception:
+            pass
+        self._log(f"自动落子 {chinese} {best} @ {pts['from']}→{pts['to']}")
+        self.status.emit(f"自动落子：{chinese}（{best}）")
+
+    def apply_auto_params(self, p: dict) -> None:
+        """应用自动走棋参数（Worker 线程内调用）。"""
+        prev = self.auto_move_enabled
+        self.auto_move_enabled = bool(p.get("enabled", self.auto_move_enabled))
+        self.auto_think_ms = max(100, int(p.get("think_ms", self.auto_think_ms)))
+        self.auto_dry_run = bool(p.get("dry_run", self.auto_dry_run))
+        self.auto_click_mode = p.get("click_mode", self.auto_click_mode)
+        self.auto_cooldown = float(p.get("cooldown", self.auto_cooldown))
+        self.auto_max_moves = max(1, int(p.get("max_moves", self.auto_max_moves)))
+        self.auto_restore_cursor = bool(
+            p.get("restore_cursor", self.auto_restore_cursor))
+        self.auto_move_steps = max(1, int(p.get("move_steps", self.auto_move_steps)))
+        if "place_wait" in p:
+            self.auto_place_wait = max(0.3, float(p["place_wait"]))
+
+        if self.auto_move_enabled and self._clicker is None:
+            self._clicker = MouseClicker(mode=self.auto_click_mode,
+                                         move_steps=self.auto_move_steps,
+                                         restore_cursor=self.auto_restore_cursor)
+        elif self._clicker is not None:
+            self._clicker.mode = self.auto_click_mode
+            self._clicker.move_steps = self.auto_move_steps
+            self._clicker.restore_cursor = self.auto_restore_cursor
+
+        if self.auto_move_enabled and not prev:
+            # 刚开启：清掉上一局的计数/状态
+            self._auto_moves_made = 0
+            self._auto_done = ("", "")
+            self._auto_pending = None
+            self._auto_retries = 0
+            self.status.emit("自动走棋已启用" +
+                             ("（预览模式，不真点）" if self.auto_dry_run else ""))
+            # 当前若在分析中，用有限搜索重开一次，确保拿得到 bestmove
+            if self._cur_fen_base:
+                try:
+                    self._start_search(
+                        fen_with_side(self._cur_fen_base, self._cur_side))
+                except Exception:
+                    pass
+        if not self.auto_move_enabled:
+            self._auto_pending = None
+        try:
+            self.auto_state_changed.emit(self.auto_move_enabled)
+        except Exception:
+            pass
+
     # ---- 主线程 → Worker 的命令入口（线程安全，只往队列里塞）----
     def post_params(self, params: dict) -> None:
         """提交引擎参数变更（主线程调用）。"""
@@ -671,6 +928,10 @@ class Worker(QObject):
         """请求清空置换表（主线程调用）。"""
         self._cmds.put(("clear", None))
 
+    def post_auto(self, params: dict) -> None:
+        """提交自动走棋参数变更（主线程调用）。"""
+        self._cmds.put(("auto", params))
+
     def _process_commands(self) -> None:
         """在 Worker 线程内消费命令队列（循环顶部调用）。
 
@@ -678,6 +939,7 @@ class Worker(QObject):
         SpinBox 时反复「停搜索→下发→重启」把引擎抖崩。
         """
         last_params = None
+        last_auto = None
         do_clear = False
         drained = False
         while True:
@@ -688,6 +950,8 @@ class Worker(QObject):
             drained = True
             if kind == "params":
                 last_params = payload
+            elif kind == "auto":
+                last_auto = payload
             elif kind == "clear":
                 do_clear = True
         if not drained:
@@ -702,6 +966,11 @@ class Worker(QObject):
                 self.apply_engine_params(last_params)
             except Exception as exc:
                 self.error.emit(f"参数应用失败: {exc}")
+        if last_auto is not None:
+            try:
+                self.apply_auto_params(last_auto)
+            except Exception as exc:
+                self.error.emit(f"自动走棋参数失败: {exc}")
 
     def apply_engine_params(self, params: dict) -> None:
         """运行中热改引擎参数：停当前搜索 → 下发 → 用新参数重跑当前局面。"""
@@ -995,6 +1264,7 @@ class MainWindow(QMainWindow):
         av.addWidget(self.table)
 
         right = QVBoxLayout()
+        right.addWidget(self._build_automove_panel())   # 自动走棋（置顶，安全相关）
         right.addWidget(engine_grp)
         right.addWidget(info)
         right.addWidget(alt, 1)
@@ -1041,18 +1311,19 @@ class MainWindow(QMainWindow):
             "若猜错，引擎着法的合法性会在第一次分析后自动纠正。")
 
         # 我方执子方 —— 与「先手」是两个独立维度：
-        # 「先手」决定该谁走，「我方执子」只决定胜率视角与左栏显示朝向。
+        # 「先手」决定该谁走，「我方执子」只决定左栏显示朝向。
         # 识别模型的拉正流程按内容摆正棋盘（黑方底线恒在 row 0），
-        # 所以这个选项不再影响局面识别，只决定「胜率按谁的视角」与
-        # 「左栏显示图朝哪边」（执黑时把显示图转 180°，让我方在下）。
+        # 所以这个选项不再影响局面识别，只决定「左栏显示图朝哪边」
+        # （执黑时把显示图转 180°，让我方在下）。
         self.combo_my_side = QComboBox()
         self.combo_my_side.addItem("我方执红", "w")
         self.combo_my_side.addItem("我方执黑", "b")
         self.combo_my_side.setToolTip(
             "你在这局里执哪一方。\n"
             "识别模型会自动把棋盘摆正（谁在下都能正确识别），\n"
-            "此项只影响：胜率按我方视角换算、左栏盘面朝向我方。\n"
-            "选错不会导致局面颠倒，只会让胜率视角与左栏朝向反着。")
+            "此项只影响：左栏盘面朝向我方。\n"
+            "「当前建议」栏的胜率按红/黑方绝对视角给出，与本项无关。\n"
+            "选错不会导致局面颠倒，只会让左栏朝向反着。")
 
         self.btn_run = QPushButton("开始")
         self.btn_run.setMinimumWidth(96)
@@ -1088,6 +1359,8 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage(f"DPI: {dpi} · 就绪")
         self.refresh_windows()
+        self._load_auto_config()
+        self._update_auto_indicator(self.chk_auto.isChecked())
 
     # ---------------- 引擎参数面板 ----------------
     def _build_engine_panel(self) -> QGroupBox:
@@ -1161,6 +1434,242 @@ class MainWindow(QMainWindow):
         self.chk_wdl.toggled.connect(self._on_param_changed)
         self.btn_clear_hash.clicked.connect(self._on_clear_hash)
         return grp
+
+    # ---------------- 自动走棋面板 ----------------
+    def _build_automove_panel(self) -> QGroupBox:
+        """构建「自动走棋」面板（默认折叠）。
+
+        该功能会**模拟鼠标点击替我方落子**，所以默认关闭、且默认处于
+        「预览模式（只算不点）」，需要用户显式关闭预览才会真正点击。
+        """
+        grp = QGroupBox("自动走棋（模拟鼠标点击）")
+        grp.setCheckable(True)
+        grp.setChecked(False)                 # 默认折叠
+
+        outer = QVBoxLayout(grp)
+        outer.setContentsMargins(6, 6, 6, 6)
+
+        # 运行指示放在 body 之外 —— 折叠时依然可见（安全相关，必须醒目）
+        self.lbl_auto_state = QLabel("● 自动走棋运行中")
+        self.lbl_auto_state.setAlignment(Qt.AlignCenter)
+        self.lbl_auto_state.setStyleSheet(
+            "background:#c0392b; color:#ffffff; font-weight:700; "
+            "padding:3px 8px; border-radius:3px;")
+        self.lbl_auto_state.hide()
+        outer.addWidget(self.lbl_auto_state)
+
+        body = QWidget()
+        grid = QGridLayout(body)
+        grid.setContentsMargins(0, 0, 0, 0)
+
+        self.chk_auto = QCheckBox("启用自动走棋（只走我方）")
+        self.chk_auto.setToolTip(
+            "开启后：识别到轮到我方且局面稳定时，取引擎最佳着法，\n"
+            "用鼠标模拟点击「起点 → 终点」替我落子。\n"
+            "对手仍在真实平台上下棋，本程序不动对方棋子。")
+
+        self.chk_dry = QCheckBox("预览模式（只算不点）")
+        self.chk_dry.setChecked(True)
+        self.chk_dry.setToolTip(
+            "勾选时只把「将要点击的着法与坐标」显示出来，不真的动鼠标。\n"
+            "首次使用请先保持勾选，确认坐标无误后再取消。")
+
+        self.spin_auto_think = QSpinBox()
+        self.spin_auto_think.setRange(300, 10000)
+        self.spin_auto_think.setSingleStep(100)
+        self.spin_auto_think.setValue(1200)
+        self.spin_auto_think.setSuffix(" ms")
+        self.spin_auto_think.setToolTip(
+            "自动走棋的思考时间。开启自动走棋时会强制用「限时搜索」\n"
+            "（持续加深模式永远不返回确定着法，无法用于落子）。")
+
+        self.combo_click_mode = QComboBox()
+        self.combo_click_mode.addItem("两次点击（推荐）", "two_click")
+        self.combo_click_mode.addItem("拖拽", "drag")
+        self.combo_click_mode.setToolTip(
+            "两次点击：点起点选子 → 点终点落子（多数象棋界面支持）。\n"
+            "拖拽：按住起点拖到终点（部分界面只认这种）。")
+
+        self.spin_auto_cooldown = QDoubleSpinBox()
+        self.spin_auto_cooldown.setRange(0.0, 10.0)
+        self.spin_auto_cooldown.setSingleStep(0.5)
+        self.spin_auto_cooldown.setDecimals(1)
+        self.spin_auto_cooldown.setValue(1.5)
+        self.spin_auto_cooldown.setSuffix(" s")
+
+        self.spin_auto_max = QSpinBox()
+        self.spin_auto_max.setRange(1, 999)
+        self.spin_auto_max.setValue(200)
+        self.spin_auto_max.setToolTip("连续自动落子达到此数后自动停止（保险丝）。")
+
+        self.chk_restore = QCheckBox("点击后恢复光标")
+        self.chk_restore.setChecked(False)
+        self.chk_restore.setToolTip(
+            "落子后把鼠标移回原位。开启会与用户手动操作抢光标，默认关闭。")
+
+        self.spin_steps = QSpinBox()
+        self.spin_steps.setRange(1, 12)
+        self.spin_steps.setValue(1)
+        self.spin_steps.setToolTip(
+            "光标移动的插值步数。1=直接跳到目标；\n"
+            "若某些界面需要鼠标「移过去」才响应悬停，可调到 4~8。")
+
+        self.btn_auto_stop = QPushButton("紧急停止自动走棋")
+        self.btn_auto_stop.clicked.connect(self._on_auto_stop)
+
+        self.lbl_auto_last = QLabel("—")
+        self.lbl_auto_last.setWordWrap(True)
+        self.lbl_auto_last.setStyleSheet("color:#98a2b0; font-size:11px;")
+
+        grid.addWidget(self.chk_auto, 0, 0, 1, 2)
+        grid.addWidget(self.chk_dry, 1, 0, 1, 2)
+        grid.addWidget(QLabel("思考时间"), 2, 0)
+        grid.addWidget(self.spin_auto_think, 2, 1)
+        grid.addWidget(QLabel("落子方式"), 3, 0)
+        grid.addWidget(self.combo_click_mode, 3, 1)
+        grid.addWidget(QLabel("落子冷却"), 4, 0)
+        grid.addWidget(self.spin_auto_cooldown, 4, 1)
+        grid.addWidget(QLabel("最大连续走子"), 5, 0)
+        grid.addWidget(self.spin_auto_max, 5, 1)
+        grid.addWidget(QLabel("移动插值步数"), 6, 0)
+        grid.addWidget(self.spin_steps, 6, 1)
+        grid.addWidget(self.chk_restore, 7, 0, 1, 2)
+        grid.addWidget(self.btn_auto_stop, 8, 0, 1, 2)
+        grid.addWidget(self.lbl_auto_last, 9, 0, 1, 2)
+        outer.addWidget(body)
+
+        body.setVisible(False)
+        grp.toggled.connect(body.setVisible)
+
+        # 控件变化 → 下发 Worker（信号最后连，避免构造期触发）
+        self.chk_auto.toggled.connect(self._on_auto_changed)
+        self.chk_dry.toggled.connect(self._on_auto_changed)
+        for w in (self.spin_auto_think, self.spin_auto_max, self.spin_steps):
+            w.valueChanged.connect(self._on_auto_changed)
+        self.spin_auto_cooldown.valueChanged.connect(self._on_auto_changed)
+        self.combo_click_mode.currentIndexChanged.connect(self._on_auto_changed)
+        self.chk_restore.toggled.connect(self._on_auto_changed)
+        return grp
+
+    def _collect_auto_params(self) -> dict:
+        return {
+            "enabled": self.chk_auto.isChecked(),
+            "think_ms": self.spin_auto_think.value(),
+            "dry_run": self.chk_dry.isChecked(),
+            "click_mode": self.combo_click_mode.currentData() or "two_click",
+            "cooldown": float(self.spin_auto_cooldown.value()),
+            "max_moves": self.spin_auto_max.value(),
+            "restore_cursor": self.chk_restore.isChecked(),
+            "move_steps": self.spin_steps.value(),
+        }
+
+    def _on_auto_changed(self, *_args) -> None:
+        """自动走棋参数变化 → 经命令队列下发（不能走 Qt 信号，见 post_params）。"""
+        on = self.chk_auto.isChecked()
+        # 自动走棋需要确定 bestmove，而「持续加深」永不返回 → 置灰
+        inf = getattr(self, "chk_infinite", None)
+        if inf is not None:
+            inf.setEnabled(not on)
+        self._update_auto_indicator(on)
+        self._schedule_auto_save()
+        if self.worker is not None:
+            self.worker.post_auto(self._collect_auto_params())
+
+    def _on_auto_stop(self) -> None:
+        """紧急停止：只关自动走棋，不终止识别。"""
+        self.chk_auto.setChecked(False)
+
+    def _update_auto_indicator(self, on: bool) -> None:
+        if not hasattr(self, "lbl_auto_state"):
+            return
+        if on:
+            dry = self.chk_dry.isChecked()
+            self.lbl_auto_state.setText(
+                "● 自动走棋运行中（预览）" if dry else "● 自动走棋运行中（真点）")
+            self.lbl_auto_state.show()
+        else:
+            self.lbl_auto_state.hide()
+
+    @Slot(bool)
+    def on_auto_state(self, on: bool) -> None:
+        """Worker 通知自动走棋开关变化（含保险丝/重试超限导致的自动关闭）。"""
+        self.chk_auto.blockSignals(True)
+        self.chk_auto.setChecked(bool(on))
+        self.chk_auto.blockSignals(False)
+        inf = getattr(self, "chk_infinite", None)
+        if inf is not None:
+            inf.setEnabled(not on)
+        self._update_auto_indicator(on)
+
+    @Slot(dict)
+    def on_auto_preview(self, d: dict) -> None:
+        """显示最近一次自动走棋的预览/落子信息。"""
+        if not hasattr(self, "lbl_auto_last"):
+            return
+        tag = "预览" if d.get("dry") else "已落子"
+        frm, to = d.get("from"), d.get("to")
+        coord = ""
+        if frm and to:
+            coord = f"  起点({frm[0]:.0f},{frm[1]:.0f}) 终点({to[0]:.0f},{to[1]:.0f})"
+        self.lbl_auto_last.setText(
+            f"{tag}: {d.get('chinese', '')} ({d.get('best', '')}){coord}")
+
+    # ---------------- 自动走棋配置持久化 ----------------
+    def _auto_cfg_path(self) -> Path:
+        return app_base() / "automove.json"
+
+    def _load_auto_config(self) -> None:
+        """读取 automove.json 回填面板。
+
+        **刻意不持久化「启用」开关** —— 每次启动都从关闭状态开始，
+        避免上次退出时开着、下次一启动就开始点鼠标。
+        """
+        try:
+            p = self._auto_cfg_path()
+            if not p.is_file():
+                return
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        widgets = (self.chk_auto, self.chk_dry, self.spin_auto_think,
+                   self.combo_click_mode, self.spin_auto_cooldown,
+                   self.spin_auto_max, self.chk_restore, self.spin_steps)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self.chk_dry.setChecked(bool(data.get("dry_run", True)))
+            self.spin_auto_think.setValue(int(data.get("think_ms", 1200)))
+            idx = self.combo_click_mode.findData(
+                str(data.get("click_mode", "two_click")))
+            if idx >= 0:
+                self.combo_click_mode.setCurrentIndex(idx)
+            self.spin_auto_cooldown.setValue(float(data.get("cooldown", 1.5)))
+            self.spin_auto_max.setValue(int(data.get("max_moves", 200)))
+            self.chk_restore.setChecked(bool(data.get("restore_cursor", False)))
+            self.spin_steps.setValue(int(data.get("move_steps", 1)))
+        except Exception:
+            pass
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+
+    def _save_auto_config(self) -> None:
+        try:
+            p = self._auto_cfg_path()
+            data = self._collect_auto_params()
+            data.pop("enabled", None)          # 不持久化总开关（见 _load_auto_config）
+            p.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+        except Exception:
+            pass
+
+    def _schedule_auto_save(self) -> None:
+        """去抖写盘：拖 SpinBox 时不要每次都落盘。"""
+        if not hasattr(self, "_auto_save_timer"):
+            self._auto_save_timer = QTimer(self)
+            self._auto_save_timer.setSingleShot(True)
+            self._auto_save_timer.timeout.connect(self._save_auto_config)
+        self._auto_save_timer.start(600)
 
     def _on_infinite_toggled(self, on: bool) -> None:
         """「持续加深」勾选时禁用「思考」时间（该模式下无意义）。"""
@@ -1398,6 +1907,16 @@ class MainWindow(QMainWindow):
         self.worker.show_wdl = params["show_wdl"]
         self.worker.infinite = params["infinite"]
         self.worker.engine_opts = params["advanced"]
+        # 自动走棋初值（与 movetime/confirm 一样，启动前直接写字段）
+        auto = self._collect_auto_params()
+        self.worker.auto_move_enabled = auto["enabled"]
+        self.worker.auto_think_ms = auto["think_ms"]
+        self.worker.auto_dry_run = auto["dry_run"]
+        self.worker.auto_click_mode = auto["click_mode"]
+        self.worker.auto_cooldown = auto["cooldown"]
+        self.worker.auto_max_moves = auto["max_moves"]
+        self.worker.auto_restore_cursor = auto["restore_cursor"]
+        self.worker.auto_move_steps = auto["move_steps"]
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -1407,7 +1926,10 @@ class MainWindow(QMainWindow):
         self.worker.status.connect(self.statusBar().showMessage)
         self.worker.error.connect(lambda m: self.statusBar().showMessage(f"错误: {m}"))
         self.worker.done.connect(self.on_done)
+        self.worker.auto_state_changed.connect(self.on_auto_state)
+        self.worker.auto_preview.connect(self.on_auto_preview)
         self.thread.start()
+        self._update_auto_indicator(self.chk_auto.isChecked())
         self.btn_run.setText("停止")
         self.combo.setEnabled(False)
         self.combo_my_side.setEnabled(False)
@@ -1415,7 +1937,13 @@ class MainWindow(QMainWindow):
 
     def stop(self) -> None:
         if self.worker:
+            # 先关自动走棋，避免停止过程中还去点鼠标
+            try:
+                self.worker.post_auto({"enabled": False})
+            except Exception:
+                pass
             self.worker.stop()
+        self._update_auto_indicator(False)
         self.btn_run.setText("停止中…")
 
     # ---------------- 结果 ----------------
@@ -1452,9 +1980,11 @@ class MainWindow(QMainWindow):
         self.combo.setEnabled(True)
         self.combo_my_side.setEnabled(True)
         self.combo_side.setEnabled(True)
+        self._update_auto_indicator(False)
         self.statusBar().showMessage("已停止")
 
     def closeEvent(self, ev) -> None:
+        self._save_auto_config()
         self.stop()
         if self.thread:
             self.thread.quit()
