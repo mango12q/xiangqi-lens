@@ -13,7 +13,7 @@ sys.path.insert(0, str(HERE))
 
 from cchess import ChessBoard, FULL_INIT_FEN
 
-from app_backend import (TurnManager, _fen_rows, fen_with_side, legal_moves,
+from app_backend import (TurnManager, _rows_of, fen_with_side, legal_moves,
                          move_to_chinese, validate_fen)
 
 
@@ -34,7 +34,7 @@ def make(fen: str, *moves: str) -> str:
 
 
 def rows_of(fen: str) -> str:
-    return "".join(_fen_rows(fen))
+    return "".join(_rows_of(fen))
 
 
 def main() -> int:
@@ -47,7 +47,7 @@ def main() -> int:
 
     print()
     print("[1] FEN 展开检查")
-    r = _fen_rows(START)
+    r = _rows_of(START)
     print(f"    行数={len(r)}  每行长度={[len(x) for x in r]}")
     if len(r) != 10 or any(len(x) != 9 for x in r):
         print("    [失败] FEN 展开错误")
