@@ -40,53 +40,57 @@ def main() -> int:
         fails += 0 if ok else 1
 
     print()
-    print("[2] format_winrate —— 红方视角（我方执红）")
-    wdl = (72, 917, 11)
-    s = format_winrate(wdl, 27, my_side="w")
-    print(f"    wdl={wdl} 我方执红 → {s}")
-    ok = "7%" in s or "6%" in s
-    print(f"    红方胜率应约 7%  {'OK' if ok else '!!'}")
+    print("[2] format_winrate —— 红方占优（只说优势方）")
+    wdl = (800, 150, 50)
+    s = format_winrate(wdl, None, my_side="w")
+    print(f"    wdl={wdl} → {s}")
+    ok = s.startswith("红方优势") and "红方胜率约 80%" in s
+    print(f"    应为「红方优势，红方胜率约 80%」  {'OK' if ok else '!!'}")
     fails += 0 if ok else 1
 
     print()
-    print("[3] format_winrate —— 黑方视角（我方执黑，同一局面）")
-    s2 = format_winrate(wdl, 27, my_side="b")
-    print(f"    wdl={wdl} 我方执黑 → {s2}")
-    # 黑方视角：负率 11/1000 ≈ 1.1%
-    ok2 = "1%" in s2
-    print(f"    黑方胜率应约 1%  {'OK' if ok2 else '!!'}")
+    print("[3] format_winrate —— 黑方占优（只说优势方）")
+    s2 = format_winrate((50, 150, 800), None, my_side="w")
+    print(f"    wdl=(50, 150, 800) → {s2}")
+    ok2 = s2.startswith("黑方优势") and "黑方胜率约 80%" in s2
+    print(f"    应为「黑方优势，黑方胜率约 80%」  {'OK' if ok2 else '!!'}")
     fails += 0 if ok2 else 1
 
     print()
-    print("[4] 和棋倾向判定")
-    s3 = format_winrate((72, 917, 11), 27, "w")
-    ok3 = "和棋倾向" in s3
-    print(f"    和率 92% 应判为「和棋倾向」 → {'OK' if ok3 else '!!'}")
-    fails += 0 if ok3 else 1
+    print("[4] 均势判定（含高和率局面）")
+    cases = [
+        ((300, 400, 300), "均势（红 30% / 黑 30%）"),
+        ((72, 917, 11), "均势（红 7% / 黑 1%）"),   # 和率 92%，两边都弱
+    ]
+    for wdl_c, expect in cases:
+        got = format_winrate(wdl_c, None, "w")
+        ok_c = got == expect
+        print(f"    wdl={wdl_c} → {got}")
+        print(f"      期望「{expect}」 {'OK' if ok_c else '!!'}")
+        fails += 0 if ok_c else 1
 
     print()
-    print("[5] 优劣判定")
-    cases = [
-        ((800, 150, 50), "我方大优", "w"),
-        ((50, 150, 800), "我方劣势", "w"),
-        ((300, 400, 300), "均势", "w"),
-        ((50, 150, 800), "我方大优", "b"),      # 同一局面，黑方视角
-    ]
-    for wdl_c, expect, side in cases:
-        got = format_winrate(wdl_c, None, side)
-        ok_c = expect in got
-        print(f"    wdl={wdl_c} 我方={'红' if side=='w' else '黑'} → {got}")
-        print(f"      期望含「{expect}」 {'OK' if ok_c else '!!'}")
-        fails += 0 if ok_c else 1
+    print("[5] 视角无关：my_side 不再影响输出（红/黑绝对视角）")
+    same = all(
+        format_winrate(c, None, "w") == format_winrate(c, None, "b")
+        for c in ((800, 150, 50), (50, 150, 800), (300, 400, 300), (72, 917, 11))
+    )
+    print(f"    执红 / 执黑输出一致 ? {same}")
+    fails += 0 if same else 1
 
     print()
     print("[6] 无 wdl 时用 cp 兜底估算")
     for cp in (0, 100, 300, -300, 1000):
         s_c = format_winrate(None, cp, "w")
         print(f"    cp={cp:+5} → {s_c}")
-    ok6 = format_winrate(None, 0, "w").startswith("我方胜率 5")
-    print(f"    cp=0 应约 50%  {'OK' if ok6 else '!!'}")
+    ok6 = format_winrate(None, 0, "w") == "均势（红 50% / 黑 50%，估算）"
+    print(f"    cp=0 应为均势 50/50  {'OK' if ok6 else '!!'}")
     fails += 0 if ok6 else 1
+    ok6b = "红方优势" in format_winrate(None, 300, "w")
+    ok6c = "黑方优势" in format_winrate(None, -300, "w")
+    print(f"    cp=+300 红方占优 {'OK' if ok6b else '!!'}"
+          f" · cp=-300 黑方占优 {'OK' if ok6c else '!!'}")
+    fails += 0 if (ok6b and ok6c) else 1
 
     print()
     print("[7] winrate_from_cp 单调性（分数越高胜率越高）")
