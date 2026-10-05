@@ -64,8 +64,10 @@ class Worker(QObject):
         self.confirm = 3
         # first_side：首帧轮次（红先/黑先），只影响"该谁走"
         self.first_side = "w"
-        # my_side：我方执子方（红/黑）。执黑时棋盘在屏幕上与标准 FEN 上下颠倒，
-        # 必须翻转矩阵才能得到正确局面 —— 这是与 first_side 完全独立的一维。
+        # my_side：我方执子方（红/黑）。**只影响两处呈现**：胜率视角
+        # （format_winrate）与左栏显示图的朝向。矩阵/FEN 永远是标准朝向，
+        # 因为识别模型的拉正流程已按内容把黑方底线摆到 row 0（见 run() 里的注释）。
+        # 这是与 first_side 完全独立的一维。
         self.my_side = "w"
         self._run = False
         self._vision = None
@@ -209,11 +211,18 @@ class Worker(QObject):
                 time.sleep(0.3)
                 continue
 
-            # 朝向归一：识别模型假设画面里红方在下方（row 0 = 黑方底线）。
-            # 我方执黑时画面是上下颠倒的，必须旋转 180° 才能得到标准 FEN。
+            # 朝向：识别模型的关键点是「黑方两角 A0/A8、红方两角 J0/J8」
+            # （见 xq_vision.BONE_NAMES），拉正流程本身就会把黑方底线摆到
+            # row 0 —— 无论哪一方在画面下方，模型输出都已经是标准朝向。
+            # 所以这里**不能**按「我方执子」再翻一次：那会把已经摆正的矩阵
+            # 翻反，黑将跑到 row 9，被 check_position 判「黑将在九宫外」，
+            # 每帧都挡下（表现为状态栏一直刷「局面变化无法解释，已挡下」）。
+            # 只做兜底自检：万一模型真把黑将摆到了下方，才翻转。
             rows = res["rows"]
-            if self.my_side == "b":
+            if (any("k" in rows[i] for i in (7, 8, 9))
+                    and not any("k" in rows[i] for i in (0, 1, 2))):
                 rows = self.flip_rows(rows)
+                self._log("朝向自检：黑将在下方，已翻转 180°（模型输出异常）")
             key = "".join(rows)
 
             # pose 几何校验：画面里没有棋盘时，模型会输出退化的四边形
@@ -236,7 +245,7 @@ class Worker(QObject):
                 time.sleep(0.10)
                 continue
 
-            # 用翻转后的矩阵生成 FEN（此时 row 0 一定是黑方底线）
+            # 矩阵已是标准朝向（row 0 = 黑方底线），直接生成 FEN
             fen_base = self.rows_to_fen(rows, "w")
 
             # 演化校验 + 轮次推进（BoardTracker 内部处理）
@@ -334,6 +343,8 @@ class Worker(QObject):
                 "moves": n_moves,
                 "side": side,
                 "note": move_note,
+                # 仅表示「左栏显示图是否转 180° 让画面朝向与我方一致」，
+                # 与矩阵/FEN 无关（矩阵永远保持标准朝向）
                 "flipped": self.my_side == "b",
                 "winrate": winrate,
                 "wdl": wdl,
@@ -342,6 +353,10 @@ class Worker(QObject):
                 "guard": self._tracker.stats,
             }
             warped = cv2.cvtColor(res["warped"], cv2.COLOR_RGB2BGR)
+            if self.my_side == "b":
+                # 只转「拿来显示」的那张图：我方执黑时让盘面在左栏里也是
+                # 我方在下，看着顺手。矩阵不动，FEN 仍然正确。
+                warped = cv2.rotate(warped, cv2.ROTATE_180)
             self.frame_ready.emit(bgr, warped, fen, diag, key)
             side_cn = "红" if side == "w" else "黑"
             self.status.emit(f"{side_cn}方走 · 深度 {diag['depth']} · "
@@ -623,17 +638,19 @@ class MainWindow(QMainWindow):
             "开局轮次（该谁先走）。识别看不出轮到谁走，只能先猜；\n"
             "若猜错，引擎着法的合法性会在第一次分析后自动纠正。")
 
-        # 我方执子方 —— 与「先手」是完全独立的一维：
-        # 「先手」决定该谁走，「我方执子」决定画面朝向。
-        # 执黑时棋盘在屏幕上与标准 FEN 上下颠倒，必须翻转矩阵，
-        # 否则识别出的局面整个是错的、箭头也会指反。
+        # 我方执子方 —— 与「先手」是两个独立维度：
+        # 「先手」决定该谁走，「我方执子」只决定胜率视角与左栏显示朝向。
+        # 识别模型的拉正流程按内容摆正棋盘（黑方底线恒在 row 0），
+        # 所以这个选项不再影响局面识别，只决定「胜率按谁的视角」与
+        # 「左栏显示图朝哪边」（执黑时把显示图转 180°，让我方在下）。
         self.combo_my_side = QComboBox()
         self.combo_my_side.addItem("我方执红", "w")
         self.combo_my_side.addItem("我方执黑", "b")
         self.combo_my_side.setToolTip(
             "你在这局里执哪一方。\n"
-            "执黑时棋盘在画面上是上下颠倒的，程序会翻转矩阵还原成标准局面。\n"
-            "选错的后果：局面整个颠倒，走法建议全部无效。")
+            "识别模型会自动把棋盘摆正（谁在下都能正确识别），\n"
+            "此项只影响：胜率按我方视角换算、左栏盘面朝向我方。\n"
+            "选错不会导致局面颠倒，只会让胜率视角与左栏朝向反着。")
 
         self.btn_run = QPushButton("开始")
         self.btn_run.setMinimumWidth(96)
