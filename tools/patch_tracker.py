@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-TARGET = Path(r"D:\opencode\XiangQiLink\app_backend.py")
+# 相对本脚本定位仓库，不再硬编码本机绝对路径
+TARGET = Path(__file__).resolve().parent.parent / "app_backend.py"
 
 NEW_CLASS = '''
 class BoardTracker:

@@ -23,7 +23,7 @@ import numpy as np
 
 # 版本号：同时用于窗口标题、运行日志与打包产物命名，
 # 便于用户确认自己用的是哪一版。
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 HERE = Path(__file__).resolve().parent
 
@@ -1788,7 +1788,14 @@ def selftest(image: str | None, movetime: int) -> int:
         _write_selftest_log(log_lines)
         return 3
     t0 = time.perf_counter()
-    r = eng.analyse(fen, movetime_ms=movetime)
+    try:
+        r = eng.analyse(fen, movetime_ms=movetime)
+    except Exception as exc:
+        # 引擎中途退出/管道关闭：给出明确原因，别让自检抛 traceback
+        say(f"      [失败] 引擎分析失败: {exc}")
+        eng.quit()
+        _write_selftest_log(log_lines)
+        return 4
     best = r.get("bestmove") or ""
     say(f"      bestmove = {best} ({move_to_chinese(fen, best)})")
     say(f"      score    = {format_score(r.get('score_cp'))}   depth = {r.get('depth')}")

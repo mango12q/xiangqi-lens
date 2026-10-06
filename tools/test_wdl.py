@@ -7,10 +7,21 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
+from pathlib import Path
 
-EXE = r"D:\opencode\xq_research\pikafish\Pikafish-Windows-x86-64-universal.exe"
-CWD = r"D:\opencode\xq_research\pikafish"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from _common import bootstrap  # noqa: E402
+
+bootstrap()
+
+# 不再硬编码本机路径：统一从 app_backend 取（它自己会按候选位置找 xq_research）
+from app_backend import ENGINE_EXE  # noqa: E402
+
+EXE = str(ENGINE_EXE)
+CWD = str(ENGINE_EXE.parent)
 FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1"
 
 

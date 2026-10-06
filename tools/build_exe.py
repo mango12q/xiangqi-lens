@@ -43,17 +43,42 @@ ASSETS = [
     "engine_client.py",
 ]
 
-# 上面这两项是**代码**，仓库里有入库副本（vendor/）。打包一律优先用入库副本，
+# 上面这两项是**代码**，仓库里有入库副本（vendor/）。打包一律只用入库副本，
 # 否则会出现「发出去的 exe 跑的是 xq_research/ 里的未跟踪文件、跟仓库对不上」。
 CODE_ASSETS = ("xq_vision.py", "engine_client.py")
 
+# 图标：入库在 assets/ 下。**故意不再指向别的仓库**（原来是
+# ROOT.parent/refs/chessboard/...，换台机器就静默丢图标，而且那与本项目无关）。
+ICON = ROOT / "assets" / "icon.ico"
+
+# 打包用的 spec 由 PyInstaller 生成、被 .gitignore 排除。它写着**绝对路径**，
+# 一旦留在工作区，别人直接跑 `pyinstaller XiangQiLens.spec` 就会走错目录。
+SPEC = ROOT / f"{APP_NAME}.spec"
+
+
+class MissingAsset(RuntimeError):
+    """待分发的文件缺失。代码资产缺失必须硬失败，不能静默回退。"""
+
 
 def asset_src(rel: str) -> Path:
-    """返回某个待分发文件的来源路径（代码优先取 vendor/，资源只能取 xq_research/）。"""
+    """返回某个待分发文件的来源路径。
+
+    * **代码**（``CODE_ASSETS``）：只认 ``vendor/`` 的入库副本，缺失就硬失败。
+      文件头注释早就写明「打包一律优先用入库副本」，但原来的兜底
+      （``return RESEARCH / rel``）恰恰允许了静默回退到**未跟踪**的那份，
+      而且 ``check_env()`` 校验的就是这个兜底路径 —— 所以构建照样通过，
+      发出去的 exe 跑的是仓库里没有的代码。
+    * **资源**（模型/引擎）：只能取 ``xq_research/``（体积大、各有许可证，不入库）。
+    """
     if rel in CODE_ASSETS:
         p = VENDOR / rel
-        if p.is_file():
-            return p
+        if not p.is_file():
+            raise MissingAsset(
+                f"入库的代码副本缺失: {p}\n"
+                f"        {rel} 必须存在于 vendor/xq_research/ 才能打包 ——\n"
+                f"        绝不回退到未跟踪的 {RESEARCH / rel}，否则发出去的 exe\n"
+                f"        跑的是仓库里没有的那份代码（而且不会有任何报错）。")
+        return p
     return RESEARCH / rel
 
 
@@ -76,29 +101,46 @@ def check_env() -> bool:
 
     missing = []
     for rel in ASSETS:
-        p = asset_src(rel)
+        try:
+            p = asset_src(rel)
+        except MissingAsset as exc:
+            print(f"    [失败] {exc}")
+            return False
         if not p.is_file():
             missing.append(rel)
     if missing:
         print("    [失败] 缺少资源文件:")
         for m in missing:
             print(f"           {asset_src(m)}")
-        print("           模型与引擎的获取方式见 README「依赖与准备」")
+        print("           模型与引擎的获取方式见 README「依赖资源：模型与引擎」")
         return False
+    # 图标已入库（assets/icon.ico，由 tools/make_icon.py 生成），因此缺失
+    # 就是**真问题**（被误删/误加进 .gitignore），直接硬失败而不是静默无图标。
+    if not ICON.is_file():
+        print(f"    [失败] 图标缺失: {ICON}")
+        print("           它应当已入库。重新生成：python tools/make_icon.py")
+        return False
+
     total = sum(asset_src(r).stat().st_size for r in ASSETS)
     print(f"    资源齐备，共 {total / 1024 / 1024:.1f} MB")
+
+    # 代码资产的两份副本必须一致，否则 exe 内（VENDOR）与同级 xq_research/
+    # 分发的（也是 VENDOR）虽然同源，但本机 xq_research/ 可能已经漂移 ——
+    # 源码运行时 vendor/ 优先，所以只提示，不算失败。
+    for rel in CODE_ASSETS:
+        local = RESEARCH / rel
+        if local.is_file() and local.read_bytes() != (VENDOR / rel).read_bytes():
+            print(f"    [提示] {local} 与入库副本不一致（打包只用入库副本）")
     return True
 
 
-def build() -> bool:
-    print()
-    print("[2] 运行 PyInstaller")
+def pyinstaller_args() -> list[str]:
+    """组装 PyInstaller 命令行（抽出来是为了能脱离真实构建做单元测试）。
 
-    # 清掉上次的产物，避免残留旧文件混进新包
-    for d in (BUILD, DIST):
-        if d.exists():
-            shutil.rmtree(d, ignore_errors=True)
-
+    见 ``tools/test_build_chain.py``：这里最容易出的事故是 ``--paths`` 指向
+    **未跟踪**的 ``xq_research/``，而同一次发布分发出去的却是 ``vendor/`` 的
+    副本 —— 于是 exe 里和同级目录里躺着两份不同版本的同一个模块。
+    """
     args = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm",
@@ -106,8 +148,11 @@ def build() -> bool:
         "--windowed",                  # GUI 程序，不弹控制台
         "--name", APP_NAME,
         str(ROOT / "app_vision.py"),
-        # app_vision 会 import 这两个（不在包内，属于外部资源）
-        "--paths", str(RESEARCH),
+        # ★ 用 VENDOR 而不是 RESEARCH：让「打包进 exe 的代码」与
+        #   「stage_assets() 分发出去的代码」来自同一次 asset_src() 的产物。
+        #   原来这里指 RESEARCH（未跟踪），而分发用 VENDOR，同一次发布里会塞进
+        #   两份不同版本的同一个模块，且不会有任何报错。
+        "--paths", str(VENDOR),
         # 明确声明隐藏依赖，避免被漏掉
         "--hidden-import", "xq_vision",
         "--hidden-import", "engine_client",
@@ -126,11 +171,31 @@ def build() -> bool:
     for mod in ("cryptography", "lxml", "bcrypt",
                 "pytest", "IPython", "jupyter", "tornado", "zmq"):
         args += ["--exclude-module", mod]
-    # 有图标就带上
-    icon = ROOT.parent / "refs" / "chessboard" / "server" / "icons" / "icon.ico"
-    if icon.is_file():
-        args += ["--icon", str(icon)]
-        print(f"    使用图标: {icon.name}")
+    # 图标：仓库自有的 assets/icon.ico（由 tools/make_icon.py 生成）。
+    # 原来这里指向**另一个仓库**（../refs/chessboard/server/icons/icon.ico）——
+    # 换台机器就静默丢图标，而且那个文件与本项目无依赖、许可也不明。
+    args += ["--icon", str(ICON)]
+    return args
+
+
+def build() -> bool:
+    print()
+    print("[2] 运行 PyInstaller")
+
+    # 清掉上次的产物，避免残留旧文件混进新包
+    for d in (BUILD, DIST):
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
+    args = pyinstaller_args()
+    print(f"    使用图标: {ICON}")
+
+    # 清掉上一轮生成的 spec：它写着**绝对路径**，留在工作区会让人直接
+    # `pyinstaller XiangQiLens.spec` 时走错目录（见文件头 SPEC 注释）
+    try:
+        SPEC.unlink(missing_ok=True)
+    except Exception:
+        pass
 
     t0 = time.time()
     rc = run(args, cwd=str(ROOT))
@@ -201,8 +266,18 @@ def smoke_test() -> bool:
             print(f"    {line}")
         print("    ------------------")
         log.unlink(missing_ok=True)
+        has_pass = "[通过]" in text
     else:
-        print("    [警告] 未生成 selftest.log")
+        print("    [失败] 未生成 selftest.log")
+        print("           exe 连日志都写不出来（或自检根本没跑到写日志那一步）——")
+        print("           这种 exe 不能算通过。")
+        return False
+
+    # ★ 判定不能只看 rc：_write_selftest_log 吞掉所有写入异常，所以
+    #   一个「写不了盘的 exe」也会 rc=0。日志里必须有 [通过] 才算真通过。
+    if rc == 0 and not has_pass:
+        print("    [失败] 退出码 0，但自检日志里没有 [通过] 行 —— 视为未通过")
+        return False
 
     if rc == 0:
         print("    [通过] exe 能正常加载资源、棋规与引擎")
@@ -216,14 +291,23 @@ def smoke_test() -> bool:
 
 
 def make_zip() -> Path | None:
+    """压缩成可发布的 zip。
+
+    ★ 只走 ``tools/make_release_zip.py`` 这一条实现：它按扩展名分级压缩
+      （已压过的 .onnx/.nnue 用 STORED，文本用 level 9），产物名带版本号，
+      符合发布惯例。原来这里还有一条 ``shutil.make_archive`` 的旁路，
+      产出无版本号的 ``dist/XiangQiLens.zip`` 且用默认压缩 —— 慢、体积大、
+      名字还不对，发布时容易发错包。
+    """
     print()
-    print("[5] 压缩为 zip")
-    src = DIST / APP_NAME
-    out = DIST / f"{APP_NAME}"
-    arch = shutil.make_archive(str(out), "zip", root_dir=str(DIST), base_dir=APP_NAME)
-    p = Path(arch)
-    print(f"    {p}  ({p.stat().st_size / 1024 / 1024:.1f} MB)")
-    return p
+    print("[5] 压缩为可发布的 zip（委托 tools/make_release_zip.py）")
+    rc = run([sys.executable, str(ROOT / "tools" / "make_release_zip.py")],
+             cwd=str(ROOT))
+    if rc != 0:
+        print(f"    [失败] make_release_zip 退出码 {rc}")
+        return None
+    cands = sorted(DIST.glob(f"{APP_NAME}-v*.zip"))
+    return cands[-1] if cands else None
 
 
 def main() -> int:

@@ -76,6 +76,13 @@ if _IS_WIN:
     _u32.WindowFromPoint.restype = wintypes.HWND
     _u32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
     _u32.GetAncestor.restype = wintypes.HWND
+    # ★ 必须声明 restype：ctypes 默认 c_int 是**有符号**，而
+    #   GetWindowThreadProcessId 返回的是无符号 DWORD。TID >= 0x80000000 时
+    #   两者永不相等 —— 若本线程恰好就是前台线程，就会对自身
+    #   AttachThreadInput（Windows 拒绝），绕过前台锁的机制失效，
+    #   SetForegroundWindow 更容易被拒，本次点击被跳过。
+    _k32.GetCurrentThreadId.argtypes = []
+    _k32.GetCurrentThreadId.restype = wintypes.DWORD
 
     class _MOUSEINPUT(ctypes.Structure):
         _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
@@ -230,6 +237,8 @@ class MouseClicker:
         self.backend = backend
         self._saved: tuple[int, int] | None = None
         self.last_action: dict = {}
+        # 左键当前是否处于按下态。异常路径靠它兜底抬起，见 _release_if_down。
+        self._btn_down = False
 
     # ---- 低层 ----
     def _down(self) -> None:
@@ -237,35 +246,62 @@ class MouseClicker:
             _send_input(MOUSEEVENTF_LEFTDOWN)
         else:
             _mouse_event(MOUSEEVENTF_LEFTDOWN)
+        self._btn_down = True
 
     def _up(self) -> None:
         if self.backend == "sendinput":
             _send_input(MOUSEEVENTF_LEFTUP)
         else:
             _mouse_event(MOUSEEVENTF_LEFTUP)
+        self._btn_down = False
+
+    def _release_if_down(self) -> None:
+        """异常路径兜底：左键若仍处于按下态就抬起来。
+
+        ``_down()`` 与 ``_up()`` 之间（分步移动 + 若干次 sleep）任何异常逃逸，
+        左键都会**一直保持按下**，用户桌面上表现为「拖动粘住」，直到手动
+        点一下才恢复。因此所有出口都必须过这里。
+        """
+        if not self._btn_down:
+            return
+        try:
+            self._up()
+        except Exception:
+            self._btn_down = False
 
     def move_to(self, x: float, y: float, steps: int | None = None) -> bool:
-        """移动光标；``steps>1`` 时线性插值分步移动（触发 hover 高亮）。"""
+        """移动光标；``steps>1`` 时线性插值分步移动（触发 hover 高亮）。
+
+        返回是否**每一步都移动成功**。多步分支不能无条件返回 True ——
+        ``SetCursorPos`` 失败（坐标落在虚拟桌面之外等）时若谎报成功，
+        调用方基于「预期落点」做的遮挡校验就被绕过了，点击会落在上一个
+        光标位置，也就是别的窗口上。
+        """
         steps = self.move_steps if steps is None else max(1, int(steps))
         if steps <= 1:
             return move_to(x, y)
         cx, cy = get_cursor_pos()
+        ok = True
         for i in range(1, steps + 1):
             t = i / steps
-            move_to(cx + (x - cx) * t, cy + (y - cy) * t)
+            ok = move_to(cx + (x - cx) * t, cy + (y - cy) * t) and ok
             time.sleep(self.move_step_delay)
-        return True
+        return ok
 
     # ---- 组合 ----
     def click_at(self, x: float, y: float) -> None:
-        """移动到 (x, y) 并单击左键。"""
-        self.move_to(x, y)
+        """移动到 (x, y) 并单击左键；**光标没移到位就不点**。"""
+        if not self.move_to(x, y):
+            raise RuntimeError(
+                f"光标无法移动到 ({x:.0f}, {y:.0f})，已放弃点击")
         time.sleep(self.down_up_delay)          # 让 hover 状态先建立
-        self._down()
-        time.sleep(self.down_up_delay)
-        self._up()
+        try:
+            self._down()
+            time.sleep(self.down_up_delay)
+        finally:
+            self._release_if_down()
 
-    def preview_move(self, frm, to) -> None:
+    def preview_move(self, frm) -> None:
         """只移动光标到起点、不点击（校准用）。"""
         self.move_to(frm[0], frm[1])
 
@@ -275,11 +311,15 @@ class MouseClicker:
             self._saved = get_cursor_pos()
         try:
             if self.mode == "drag":
-                self.move_to(frm[0], frm[1])
+                if not self.move_to(frm[0], frm[1]):
+                    raise RuntimeError("光标无法移动到起点，已放弃本次落子")
                 time.sleep(self.down_up_delay)
                 self._down()
                 time.sleep(self.down_up_delay)
-                self.move_to(to[0], to[1], steps=max(4, self.move_steps))
+                # 拖拽必须真的拖到终点：中途移动失败就直接抛，
+                # 由 finally 抬起左键，绝不让它停在按下态。
+                if not self.move_to(to[0], to[1], steps=max(4, self.move_steps)):
+                    raise RuntimeError("拖拽过程中光标移动失败，已放弃本次落子")
                 time.sleep(self.down_up_delay)
                 self._up()
             else:
@@ -287,6 +327,8 @@ class MouseClicker:
                 time.sleep(self.click_gap)
                 self.click_at(to[0], to[1])
         finally:
+            # ★ 顺序很重要：先抬左键，再还原光标。
+            self._release_if_down()
             if self.restore_cursor and self._saved is not None:
                 move_to(*self._saved)
         self.last_action = {"mode": self.mode, "from": tuple(frm), "to": tuple(to),

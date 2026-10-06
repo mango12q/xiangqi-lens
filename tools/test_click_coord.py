@@ -21,7 +21,11 @@ import numpy as np
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from app_backend import (ScreenSource, create_engine, create_vision,
+from _common import bootstrap, have_engine, have_vision, resolve_hwnd, skip  # noqa: E402
+
+bootstrap()
+
+from app_backend import (ScreenSource, create_engine, create_vision,  # noqa: E402
                          enable_dpi_awareness, move_arrow, move_screen_points,
                          move_to_chinese, validate_fen)
 
@@ -87,24 +91,29 @@ def main() -> int:
         return selfcheck()
 
     print(f"DPI: {enable_dpi_awareness()}")
+    if not have_vision():
+        return skip("识别模型不在本机（xq_research/hf_model/... 两个 onnx 缺失）",
+                    "按 README「依赖资源：模型与引擎」下载后重跑")
+    if not have_engine():
+        return skip("Pikafish 引擎不在本机（xq_research/pikafish/ 缺失）",
+                    "运行 python tools/setup_engine.py 后重跑")
     src = ScreenSource()
     if args.hwnd:
         hwnd = int(args.hwnd, 0)
     else:
-        cands = [w for w in ScreenSource.list_windows(120) if "JJ象棋" in w[1]]
-        if not cands:
-            print("[失败] 找不到 JJ象棋 窗口（可用 --hwnd 指定）")
-            return 1
-        hwnd = cands[0][0]
+        hwnd = resolve_hwnd(None, "JJ象棋")
+        if not hwnd:
+            return skip("未找到 JJ象棋 窗口（需要真实对局窗口才能验证）",
+                        "先打开对局界面，或用 --hwnd 指定句柄后重跑")
     src.attach(hwnd, "?")
     img = src.grab()
     if img is None:
-        print("[失败] 抓帧失败")
-        return 1
+        return skip("抓帧失败（窗口可能已最小化或被遮挡）",
+                    "让对局窗口保持可见后重跑")
     rect = src.rect
     if rect is None:
-        print("[失败] ScreenSource.rect 为空（抓帧未记录窗口矩形）")
-        return 1
+        return skip("抓帧未记录窗口矩形（PrintWindow 与屏幕抓取都失败）",
+                    "让对局窗口保持可见后重跑")
     print(f"抓帧 {img.shape[1]}x{img.shape[0]}  窗口矩形 rect={rect}")
 
     vision = create_vision(cuda=True)

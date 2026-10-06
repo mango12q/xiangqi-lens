@@ -31,10 +31,14 @@ import cv2
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from app_backend import (ScreenSource, create_engine, create_vision,
+from _common import bootstrap, have_engine, have_vision, resolve_hwnd, skip  # noqa: E402
+
+bootstrap()
+
+from app_backend import (ScreenSource, create_engine, create_vision,  # noqa: E402
                          enable_dpi_awareness, move_screen_points,
                          move_to_chinese, validate_fen, window_state)
-from app_input import (MouseClicker, ensure_foreground, foreground_hwnd,
+from app_input import (MouseClicker, ensure_foreground, foreground_hwnd,  # noqa: E402
                        get_cursor_pos, is_point_on_window, window_at_point)
 
 
@@ -52,21 +56,26 @@ def main() -> int:
     args = ap.parse_args()
 
     print(f"DPI: {enable_dpi_awareness()}")
+    if not have_vision():
+        return skip("识别模型不在本机（xq_research/hf_model/... 两个 onnx 缺失）",
+                    "按 README「依赖资源：模型与引擎」下载后重跑")
+    if not have_engine():
+        return skip("Pikafish 引擎不在本机（xq_research/pikafish/ 缺失）",
+                    "运行 python tools/setup_engine.py 后重跑")
     src = ScreenSource()
     if args.hwnd:
         hwnd = int(args.hwnd, 0)
     else:
-        cands = [w for w in ScreenSource.list_windows(120) if "JJ象棋" in w[1]]
-        if not cands:
-            print("[失败] 找不到 JJ象棋 窗口（可用 --hwnd 指定）")
-            return 1
-        hwnd = cands[0][0]
+        hwnd = resolve_hwnd(None, "JJ象棋")
+        if not hwnd:
+            return skip("未找到 JJ象棋 窗口（需要真实对局窗口才能验证）",
+                        "先打开对局界面，或用 --hwnd 指定句柄后重跑")
     print(f"目标窗口 hwnd=0x{hwnd:X}")
     ok, minimized, note = window_state(hwnd)
     print(f"窗口状态: ok={ok} minimized={minimized} {note}")
     if not ok:
-        print("[失败] 目标窗口不可用")
-        return 1
+        return skip(f"目标窗口当前不可用（{note}）",
+                    "让对局窗口保持可见、不要最小化，然后重跑")
     src.attach(hwnd, "?")
 
     # ---- 算坐标 ----
@@ -147,7 +156,7 @@ def main() -> int:
             except (EOFError, KeyboardInterrupt):
                 print("已取消")
                 return 0
-        clicker.preview_move(frm, to)
+        clicker.preview_move(frm)
         print(f"光标已移动到 {get_cursor_pos()}，请肉眼确认是否落在正确的棋子上。")
         return 0
 

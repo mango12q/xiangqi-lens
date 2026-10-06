@@ -7,11 +7,105 @@
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
+
+# ---------------------------------------------------------------------------
+# 子进程生命周期：把引擎放进「父进程一退出就一起死」的 Job Object
+# ---------------------------------------------------------------------------
+# Windows 上**子进程不会随父进程退出而终止**。所以关窗口、崩溃、被任务管理器
+# 结束进程时，Pikafish 都可能活下来变成孤儿 —— 它会和当前引擎抢 CPU 与内存，
+# 同样 movetime 的搜索要少算好几层。
+#
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 让内核在 job 句柄关闭（= 本进程退出）时
+# 自动终止 job 内全部进程。这是**不依赖时序**的唯一保证：不靠 GUI 线程在正确
+# 的时刻调用 shutdown()，也不靠线程 wait() 是否超时。
+#
+# 全程 best-effort：拿不到 job 或设置失败都只是失去这层保护，绝不影响启动。
+_JOB_HANDLE = None
+_JOB_TRIED = False
+_JOB_LOCK = threading.Lock()
+
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JobObjectExtendedLimitInformation = 9
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong)]
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32)]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+def _ensure_job():
+    """创建（一次）带 KILL_ON_JOB_CLOSE 的 job 并返回其句柄；失败返回 None。"""
+    global _JOB_HANDLE, _JOB_TRIED
+    with _JOB_LOCK:
+        if _JOB_HANDLE is not None or _JOB_TRIED:
+            return _JOB_HANDLE
+        _JOB_TRIED = True
+        if not hasattr(ctypes, "windll"):
+            return None
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.CreateJobObjectW.restype = ctypes.c_void_p
+            handle = k32.CreateJobObjectW(None, None)
+            if not handle:
+                return None
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = \
+                _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            ok = k32.SetInformationJobObject(
+                ctypes.c_void_p(handle),
+                _JobObjectExtendedLimitInformation,
+                ctypes.byref(info),
+                ctypes.sizeof(info))
+            if not ok:
+                return None
+            _JOB_HANDLE = handle          # 故意不关闭：句柄随进程退出才关闭
+            return _JOB_HANDLE
+        except Exception:
+            return None
+
+
+def _assign_to_job(proc) -> None:
+    """把 ``proc`` 放进 kill-on-close job（best-effort）。"""
+    handle = _ensure_job()
+    if not handle:
+        return
+    try:
+        ctypes.windll.kernel32.AssignProcessToJobObject(
+            ctypes.c_void_p(handle), ctypes.c_void_p(int(proc._handle)))
+    except Exception:
+        pass
 
 
 class UciEngine:
@@ -22,6 +116,10 @@ class UciEngine:
         self.exe, self.name, self.echo = exe, name, echo
         self.cwd = cwd or os.path.dirname(exe)
         self.q: queue.Queue[str] = queue.Queue()
+        # ★ 引擎已死的**权威**信号。不能用队列里的 "__EOF__" 哨兵代替它 ——
+        #   哨兵只能被消费一次，一旦被 wait_for / drain 吃掉，之后所有等待都
+        #   只能空转满超时，且无法区分「引擎已死」和「引擎没响应」。
+        self._dead = threading.Event()
         self.proc = subprocess.Popen(
             [exe],
             cwd=self.cwd,                      # ★ 必须：Pikafish 从 cwd 找 pikafish.nnue
@@ -31,6 +129,8 @@ class UciEngine:
         )
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        # 让引擎进程跟随本进程一起结束（见模块顶部 Job Object 说明）
+        _assign_to_job(self.proc)
         self.send(init_cmd)
         hdr = self.wait_for("ucciok" if init_cmd == "ucci" else "uciok", timeout=20)
         self.id_lines = [ln for ln in hdr if ln.startswith("id ")]
@@ -38,20 +138,41 @@ class UciEngine:
 
     # ---------- 底层 IO ----------
     def _read_loop(self):
-        for line in self.proc.stdout:            # type: ignore[union-attr]
-            line = line.rstrip("\r\n")
-            if self.echo:
-                print(f"[{self.name}] {line}")
-            self.q.put(line)
-        self.q.put("__EOF__")
+        try:
+            for line in self.proc.stdout:        # type: ignore[union-attr]
+                line = line.rstrip("\r\n")
+                if self.echo:
+                    print(f"[{self.name}] {line}")
+                self.q.put(line)
+        finally:
+            # 无论正常 EOF 还是读异常，都要宣告「引擎没了」。
+            self._dead.set()
+            self.q.put("__EOF__")                # 兼容既有调用方
+
+    @property
+    def dead(self) -> bool:
+        """引擎进程是否已结束（reader 线程已退出）。"""
+        return self._dead.is_set()
 
     def send(self, cmd: str):
-        self.proc.stdin.write(cmd + "\n")        # type: ignore[union-attr]
-        self.proc.stdin.flush()                  # type: ignore[union-attr]
+        # ★ 引擎已死时不要写管道：那会抛裸的 ``OSError: [Errno 22]``，
+        #   既看不出原因，也无法与「管道恰好满」区分。改成明确的异常。
+        if self._dead.is_set():
+            raise RuntimeError(f"引擎进程已退出，指令未发送: {cmd!r}")
+        try:
+            self.proc.stdin.write(cmd + "\n")    # type: ignore[union-attr]
+            self.proc.stdin.flush()              # type: ignore[union-attr]
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"引擎管道已关闭（{exc}），指令未发送: {cmd!r}") from exc
 
     def wait_for(self, prefix: str, timeout: float = 30.0):
         out, t0 = [], time.time()
         while time.time() - t0 < timeout:
+            # ★ 引擎已死且队列已排空 → 立刻返回，不要再空转满 timeout。
+            #   没有这一条时，引擎死后第二次 wait_for 会白等整个超时
+            #   （实测 1.01s），isready 也无法区分「死了」和「没响应」。
+            if self._dead.is_set() and self.q.empty():
+                break
             try:
                 line = self.q.get(timeout=0.5)
             except queue.Empty:
@@ -75,6 +196,10 @@ class UciEngine:
         self.send(f"setoption name {name} value {value}")
 
     def isready(self, timeout: float = 60.0):
+        # 引擎已死就直接返回空列表（调用方可用 ``dead`` 区分「死了」与「没响应」），
+        # 不再尝试写管道、也不空转满超时。
+        if self._dead.is_set():
+            return []
         self.send("isready")
         return self.wait_for("readyok", timeout)
 
@@ -96,37 +221,62 @@ class UciEngine:
         else:
             self.send("go depth 16")
 
-        infos, score_cp, depth_seen, best = [], None, None, None
+        infos, score_cp, depth_seen = [], None, None
+        best = ponder = None
+        got_bestmove = False
         t0 = time.time()
-        while time.time() - t0 < timeout:
-            try:
-                line = self.q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if line == "__EOF__":
-                break
-            if line.startswith("info"):
-                infos.append(line)
-                if on_info:
-                    on_info(line)
-                if " score " in line:
-                    try:
-                        seg = line.split(" score ", 1)[1].split()
-                        if seg[0] == "cp":
-                            score_cp = int(seg[1])
-                        elif seg[0] == "mate":
-                            score_cp = 30000 - abs(int(seg[1])) * 100
-                        if "depth" in line:
-                            depth_seen = int(line.split("depth ", 1)[1].split()[0])
-                    except Exception:
-                        pass
-            if line.startswith("bestmove"):
-                parts = line.split()
-                best = parts[1] if len(parts) > 1 else None
-                ponder = parts[3] if len(parts) > 3 and parts[2] == "ponder" else None
-                return {"bestmove": best, "ponder": ponder, "info": infos,
-                        "score_cp": score_cp, "depth": depth_seen}
-        return {"bestmove": best, "ponder": None, "info": infos, "score_cp": score_cp, "depth": depth_seen}
+        try:
+            while time.time() - t0 < timeout:
+                if self._dead.is_set() and self.q.empty():
+                    break
+                try:
+                    line = self.q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if line == "__EOF__":
+                    break
+                if line.startswith("info"):
+                    infos.append(line)
+                    if on_info:
+                        on_info(line)
+                    if " score " in line:
+                        # ★ 只接受 multipv 1（或没写 multipv）的分数。MultiPV>1
+                        #   时引擎按 multipv 升序逐条打印，无条件覆盖会让返回值
+                        #   变成**最差那条**主变例的分数（实测 multipv 1 cp300 /
+                        #   2 cp40 / 3 cp-1200 → 旧代码返回 -1200，应为 300）。
+                        m = re.search(r"\bmultipv (\d+)", line)
+                        if m is None or int(m.group(1)) == 1:
+                            try:
+                                seg = line.split(" score ", 1)[1].split()
+                                if seg[0] == "cp":
+                                    score_cp = int(seg[1])
+                                elif seg[0] == "mate":
+                                    score_cp = 30000 - abs(int(seg[1])) * 100
+                                if "depth" in line:
+                                    depth_seen = int(
+                                        line.split("depth ", 1)[1].split()[0])
+                            except Exception:
+                                pass
+                if line.startswith("bestmove"):
+                    parts = line.split()
+                    best = parts[1] if len(parts) > 1 else None
+                    ponder = (parts[3]
+                              if len(parts) > 3 and parts[2] == "ponder" else None)
+                    got_bestmove = True
+                    break
+        finally:
+            # ★ 超时/异常都必须显式停搜索。否则引擎仍在跑，后续 info 行无人
+            #   消费地灌进无界队列，而下一次 analyse() 会把这段残留的
+            #   bestmove 当成**新局面的**结果 —— 结果串味。
+            if not got_bestmove:
+                try:
+                    self.stop()
+                    self.wait_for("bestmove", timeout=1.0)
+                except Exception:
+                    pass
+                self.drain()
+        return {"bestmove": best, "ponder": ponder, "info": infos,
+                "score_cp": score_cp, "depth": depth_seen}
 
     def stop(self):
         self.send("stop")

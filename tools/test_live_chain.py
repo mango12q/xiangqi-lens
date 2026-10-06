@@ -13,7 +13,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from app_backend import (ScreenSource, TurnManager, create_engine, create_vision,
+from _common import bootstrap, have_engine, have_vision, resolve_hwnd, skip  # noqa: E402
+
+bootstrap()
+
+from app_backend import (ScreenSource, TurnManager, create_engine, create_vision,  # noqa: E402
                          enable_dpi_awareness, fen_with_side, format_score,
                          move_to_chinese, parse_alternatives, validate_fen)
 
@@ -30,6 +34,12 @@ def main() -> int:
     print("实时链路验证（抓帧 → 识别 → 棋规 → 轮次 → 引擎）")
     print("=" * 70)
     print(f"DPI: {enable_dpi_awareness()}")
+    if not have_vision():
+        return skip("识别模型不在本机（xq_research/hf_model/... 两个 onnx 缺失）",
+                    "按 README「依赖资源：模型与引擎」下载后重跑")
+    if not have_engine():
+        return skip("Pikafish 引擎不在本机（xq_research/pikafish/ 缺失）",
+                    "运行 python tools/setup_engine.py 后重跑")
 
     # ---- 目标窗口 ----
     src = ScreenSource()
@@ -37,13 +47,12 @@ def main() -> int:
         hwnd = int(args.hwnd, 0)
         title = next((t for h, t, c, r in ScreenSource.list_windows(120) if h == hwnd), "?")
     else:
-        cands = [w for w in ScreenSource.list_windows(120)
-                 if "JJ象棋" in w[1]] or \
-                [w for w in ScreenSource.list_windows(120) if args.keyword in w[1]]
-        if not cands:
-            print(f"[失败] 找不到含 {args.keyword!r} 的窗口")
-            return 1
-        hwnd, title, cls, rect = cands[0]
+        hwnd = resolve_hwnd(None, "JJ象棋") or resolve_hwnd(None, args.keyword)
+        if not hwnd:
+            return skip(f"未找到含 {args.keyword!r} 的窗口（需要真实对局窗口才能验证）",
+                        "先打开对局界面，或用 --hwnd 指定句柄后重跑")
+        title = next((t for h, t, c, r in ScreenSource.list_windows(120)
+                      if h == hwnd), "?")
     src.attach(hwnd, title)
     print(f"目标窗口: 0x{hwnd:08X}  {title!r}")
 
@@ -52,8 +61,8 @@ def main() -> int:
     print("[1] 抓帧")
     img = src.grab()
     if img is None:
-        print("    [失败] 抓不到画面")
-        return 1
+        return skip("抓不到画面（窗口可能已最小化或被遮挡）",
+                    "让对局窗口保持可见后重跑")
     print(f"    {img.shape[1]}x{img.shape[0]}  方式="
           f"{'后台PrintWindow' if src.stats['background'] else '前台抓屏'}")
 

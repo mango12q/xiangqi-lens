@@ -14,8 +14,11 @@ if "%BASE:~-1%"=="\" set "BASE=%BASE:~0,-1%"
 set "SCRIPT=%BASE%\app_vision.py"
 set "LOG=%BASE%\_launch_log.txt"
 
-set "PYW=C:\Users\mango\AppData\Local\Programs\Python\Python313\pythonw.exe"
-if not exist "%PYW%" call :find_pyw
+rem 优先用 PATH / py 启动器定位解释器；只有想固定某个解释器时才在这里写死。
+rem （原来这里写着一台开发机的 C:\Users\...\Python313\pythonw.exe，
+rem   对别人没有意义；留空即可，下面 :find_pyw 会自动找。）
+set "PYW="
+if not defined PYW call :find_pyw
 if not exist "%PYW%" goto :err_pyw
 set "PYN=%PYW:pythonw.exe=python.exe%"
 if not exist "%PYN%" set "PYN=%PYW%"

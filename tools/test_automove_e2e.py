@@ -19,8 +19,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from app_backend import ScreenSource, enable_dpi_awareness
-from app_vision import Worker
+from _common import bootstrap, have_engine, have_vision, resolve_hwnd, skip  # noqa: E402
+
+bootstrap()
+
+from app_backend import ScreenSource, enable_dpi_awareness  # noqa: E402
+from app_vision import Worker  # noqa: E402
 
 
 def main() -> int:
@@ -41,16 +45,26 @@ def main() -> int:
         return 1
 
     print(f"DPI: {enable_dpi_awareness()}")
+    if not have_vision():
+        return skip("识别模型不在本机（xq_research/hf_model/... 两个 onnx 缺失）",
+                    "按 README「依赖资源：模型与引擎」下载后重跑")
+    if not have_engine():
+        return skip("Pikafish 引擎不在本机（xq_research/pikafish/ 缺失）",
+                    "运行 python tools/setup_engine.py 后重跑")
     src = ScreenSource()
     if args.hwnd:
         hwnd = int(args.hwnd, 0)
+        title = "?"
     else:
-        cands = [w for w in ScreenSource.list_windows(120) if "JJ象棋" in w[1]]
-        if not cands:
-            print("[失败] 找不到 JJ象棋 窗口（可用 --hwnd 指定）")
-            return 1
-        hwnd, title = cands[0][0], cands[0][1]
-        src.attach(hwnd, title)
+        hwnd = resolve_hwnd(None, "JJ象棋")
+        if not hwnd:
+            return skip("未找到 JJ象棋 窗口（需要真实对局窗口才能验证）",
+                        "先打开对局界面，或用 --hwnd 指定句柄后重跑")
+        title = next((t for h, t, c, r in ScreenSource.list_windows(120)
+                      if h == hwnd), "?")
+    # ★ 原来这里只在 else 分支 attach，导致 --hwnd 时 src.hwnd 仍是 None、
+    #   抓帧永远返回 None，--hwnd 实际不可用。现在两个分支都 attach。
+    src.attach(hwnd, title)
     print(f"目标窗口 hwnd=0x{hwnd:X}")
 
     worker = Worker(src)
