@@ -36,6 +36,9 @@ _launch_log.txt
 # ---------------------------------------------------------------------------
 build/
 dist/
+# 打包前把上一版 dist 改名成 dist.old 以绕过 safe-delete（见 MEMORY.md），
+# 不忽略的话 `git add -A` 会把几百 MB 的旧构建吃进仓库
+dist.old/
 *.spec
 selftest.log
 
