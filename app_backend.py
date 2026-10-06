@@ -23,7 +23,7 @@ import numpy as np
 
 # 版本号：同时用于窗口标题、运行日志与打包产物命名，
 # 便于用户确认自己用的是哪一版。
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -1023,11 +1023,18 @@ def has_no_legal_moves(fen: str) -> bool:
 
     直接复用 ``cchess`` 的 ``no_moves()`` —— 它内部对每个伪合法着法都调
     ``is_checked_move()``（落子后检查自将），因此是**真**终局判定。
-    出错时返回 False（宁可漏判也不误判成终局）。
+
+    ★ 先确认**双将都在场**：``no_moves()`` 找不到己方的将时会直接返回 True，
+    非法/残缺 FEN 会被误判成终局。出错或局面残缺时返回 False
+    （宁可漏判也不误判）。
     """
     try:
         from cchess import ChessBoard
-        return bool(ChessBoard(fen).no_moves())
+        board = ChessBoard(fen)
+        if (board.get_king(board.move_player) is None
+                or board.get_king(board.move_player.opposite()) is None):
+            return False
+        return bool(board.no_moves())
     except Exception:
         return False
 

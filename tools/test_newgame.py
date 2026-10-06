@@ -117,38 +117,26 @@ def main() -> int:
     ok, reason, _mv, _side = t3.update("9/9/9/9/9/9/9/9/9/9")
     check("无法解释的跳变仍被挡下", (not ok) and reason == "drop", reason)
 
-    # ---- 3. apply_newgame ----
-    print("\n③ apply_newgame 重置")
+    # ---- 3. 新局行为 ----
+    print("\n③ 新局行为（停掉分析 + 武装自动判断）")
+    w0 = av.MainWindow()
+    check("初始未武装", w0._newgame_armed is False)
+    w0._on_new_game()                       # 停止态点「新局」
+    check("停止态点新局 → 武装待判执子", w0._newgame_armed is True)
+    check("提示用户点「分析」开始",
+          "点「分析」" in w0.statusBar().currentMessage(),
+          w0.statusBar().currentMessage())
+
+    # 新的 Worker 天生就是干净的 —— 不再需要 apply_newgame 去重置
     wk = av.Worker(ScreenSource())
-    wk.my_side = "b"
-    wk._published = "deadbeef"
-    wk._last_key = "deadbeef"
-    wk._same = 5
-    wk._auto_moves_made = 7
-    wk._game_over = True
-    wk._last_bestmove = "h2e2"
-    wk._last_bestmove_fen = "x"
-    wk._book_move = {"move": "h2e2"}
-    wk._restart_pending_t = 123.0
-    wk._cur_fen_base = "old"
-    wk.apply_newgame(True)
-    check("_published 清空", wk._published == "", wk._published)
-    check("_last_key 清空", wk._last_key == "", wk._last_key)
-    check("连续计数归零", wk._same == 0, str(wk._same))
-    check("累计走子归零", wk._auto_moves_made == 0, str(wk._auto_moves_made))
-    check("终局标记复位", wk._game_over is False)
-    check("bestmove 清空", wk._last_bestmove == "" and wk._last_bestmove_fen == "")
-    check("库着清空", wk._book_move is None)
-    check("接盘待校验时间戳清空", wk._restart_pending_t == 0.0)
-    check("当前局面清空", wk._cur_fen_base == "", wk._cur_fen_base)
-    check("武装了自动判断执子", wk.auto_side_pending is True)
-    check("轮次按「红方先手」（象棋红先，新局红方还没动子）",
-          wk._cur_side == "w", wk._cur_side)
-    check("冷却时间戳一并清零",
-          wk._auto_next_click_t == 0.0 and wk._auto_last_click_t == 0.0,
-          f"{wk._auto_next_click_t} {wk._auto_last_click_t}")
-    wk.apply_newgame(False)
-    check("auto_side=False 时不武装", wk.auto_side_pending is False)
+    check("新 Worker 的 _published 为空", wk._published == "")
+    check("新 Worker 还没有 tracker（run 里才建）", wk._tracker is None)
+    check("新 Worker 默认不武装自动判执子", wk.auto_side_pending is False)
+    check("新 Worker 默认无库着", wk._book_move is None)
+    check("新 Worker 默认轮次为红先", wk.first_side == "w", wk.first_side)
+    check("新 Worker 默认线程 2 / 哈希 256",
+          wk.threads == 2 and wk.hash_mb == 256, f"{wk.threads}/{wk.hash_mb}")
+    check("新 Worker 默认关闭动画抑制", wk.anim_suppress is False)
 
     # ---- 3b. 自动走棋的轮次硬闸门 ----
     print("\n③b 自动走棋轮次闸门（_turn_guard_blocks）")
@@ -227,6 +215,8 @@ def main() -> int:
     w2 = av.MainWindow()
     w2._on_new_game()
     check("停止态点新局 → 记下待武装", w2._newgame_armed is True)
+    check("接盘功能已彻底移除", not hasattr(w2, "_build_restart_panel")
+          and not hasattr(w2, "chk_restart"))
     w2.on_side_detected({"side": "b", "why": "黑方底线在画面下方"})
     check("回填下拉框为「我方执黑」",
           w2.combo_my_side.currentData() == "b", w2.combo_my_side.currentText())
