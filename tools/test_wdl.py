@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from _common import bootstrap  # noqa: E402
+from _common import bootstrap, have_engine, skip  # noqa: E402
 
 bootstrap()
 
@@ -91,6 +91,12 @@ def main() -> int:
     print("Pikafish UCI_ShowWDL 测试")
     print("=" * 74)
     print()
+
+    # 引擎不在仓库里（约 55MB，GPL-3.0），CI 上必然没有。
+    # 环境不具备不是回归 —— 明确跳过，否则 Popen 会抛 WinError 2。
+    if not have_engine():
+        return skip(f"Pikafish 引擎不在本机: {EXE}",
+                    "运行 python tools/setup_engine.py 后重跑")
 
     a = run(False, "默认（不开启）")
     b = run(True, "开启 WDL")
