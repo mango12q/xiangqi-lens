@@ -12,12 +12,27 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from _common import bootstrap, skip                        # noqa: E402
+
+bootstrap()
+
 from src.capture import BoardGeometry, Region                    # noqa: E402
 from src.vision import (BoardReader, TemplateLibrary, VisionConfig,  # noqa: E402
                         align_grid)
 
+# 本脚本验证的是 src/ 那条早期自研路线，依赖三份**不入库**的本地产物：
+#   shots/bg_002A0A30.png（截图）、analysis/jj_board.json（定位结果）、
+#   data/templates/jj_shitou.json（模板库，可由 build_templates.py 重建）
+_NEEDED = ("shots/bg_002A0A30.png", "analysis/jj_board.json",
+           "data/templates/jj_shitou.json")
+
 
 def main() -> int:
+    missing = [p for p in _NEEDED if not Path(p).is_file()]
+    if missing:
+        return skip("缺少本地产物: " + ", ".join(missing),
+                    "先截一张图跑 tools/analyze_board.py 与 "
+                    "tools/build_templates.py 生成，然后重跑")
     img = cv2.imdecode(np.fromfile("shots/bg_002A0A30.png", dtype=np.uint8), cv2.IMREAD_COLOR)
     data = json.loads(Path("analysis/jj_board.json").read_text(encoding="utf-8"))
     raw = Region.from_dict(data["region"])

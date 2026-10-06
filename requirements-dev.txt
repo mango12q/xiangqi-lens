@@ -1,0 +1,17 @@
+# XiangQiLens 开发/测试依赖
+#
+#     pip install -r requirements-dev.txt
+#
+# ★ 这里装的 onnxruntime 是 **CPU 版**，只为让 CI 与单元测试能跑起来。
+#   日常使用请改装 DirectML 版，否则识别会慢 5~7 倍（见 requirements.txt）：
+#       pip uninstall -y onnxruntime && pip install onnxruntime-directml
+#
+# 注意：识别模型（.onnx）与 Pikafish 引擎都**不在仓库里**（见 README
+# 「依赖资源：模型与引擎」）。缺它们时相关测试会明确打印 [跳过] 而不是失败 ——
+# 环境不具备不是代码回归，这条约定见 tools/_common.py。
+
+-r requirements.txt
+
+onnxruntime>=1.17            # CPU 版，仅供测试/CI
+pyinstaller>=6.0             # 打包（tools/build_exe.py）
+Pillow>=10.0                 # 仅 tools/make_icon.py 需要（重生成 assets/icon.ico）

@@ -160,6 +160,18 @@ def main() -> int:
     ap.add_argument("--out", default="analysis/detection_result.png")
     args = ap.parse_args()
 
+    # 本脚本验证的是**从另一个项目提取出来的** YOLO 模型（xqlink），
+    # 模型与截图都在 .gitignore 的 analysis/ 与 shots/ 下，CI 上必然没有。
+    # 环境不具备不是回归 —— 明确跳过而不是报失败。
+    if not Path(args.model).is_file():
+        from _common import skip
+        return skip(f"模型文件不在本机: {args.model}",
+                    "先用 tools/extract_model.py 提取，或用 --model 指定路径")
+    if not Path(args.image).is_file():
+        from _common import skip
+        return skip(f"测试截图不在本机: {args.image}",
+                    "shots/ 已被 .gitignore 排除；用 --image 指定一张截图")
+
     import onnxruntime as ort
     sess = ort.InferenceSession(args.model, providers=["CPUExecutionProvider"])
 

@@ -219,7 +219,11 @@ class Worker(QObject):
         self.movetime = 1200
         self.confirm = 3
         # ---- 引擎参数（UI 可调） ----
-        self.multipv = 3               # 多主变例条数
+        # ★ MultiPV 默认 1（原为 3）：MultiPV 不是「多搜几条线」，而是把同一份
+        #   movetime 摊给 N 条主变例，每条都变浅 —— 而自动走棋要走的正是第一条。
+        #   本机实测（1200ms / Threads 2 / Hash 256）：开局 深度 22→20、
+        #   中局 深度 32→23，中局一次就少了 9 层。要看候选变化请到面板里手动调高。
+        self.multipv = 1               # 多主变例条数（1 = 最强单线）
         self.infinite = False          # 持续加深（go infinite）
         self.move_overhead = 0
         self.show_wdl = True
@@ -259,6 +263,11 @@ class Worker(QObject):
         self.auto_think_ms = 1200       # 自动走棋专用思考时间（强制有限搜索）
         self.auto_dry_run = True        # 预览模式：只算不点（默认开，安全）
         self.auto_click_mode = "two_click"   # "two_click" | "drag"
+        # 鼠标注入后端："mouse_event"（默认，对齐 BGI）| "sendinput"
+        # （更现代，部分 CEF / WebView 界面只认它）。之前这个参数在
+        # app_input 里实现了、文档也承诺了，但两处构造都没传 —— 用户永远
+        # 摸不到，只有手工跑 tools/test_autoclick.py --backend 才能选。
+        self.auto_backend = "mouse_event"
         self.auto_cooldown = 1.5        # 两次落子最小间隔 s
         self.auto_max_moves = 200       # 连续走子保险丝
         self.auto_place_wait = 2.5      # 落子后等待棋盘更新的超时 s
@@ -307,17 +316,32 @@ class Worker(QObject):
         self._cmds: queue.Queue = queue.Queue()
         self._log_path, self._log_fh = self._open_log()
 
+    _LOG_MAX_BYTES = 2 * 1024 * 1024      # 超过就轮转成 XiangQiLens.log.1
+
     @staticmethod
     def _open_log():
-        """打开运行日志，写在应用根目录旁边。
+        """打开运行日志（**追加**写入），写在应用根目录旁边。
 
         打包后没有控制台，出问题时全靠这个日志定位；源码运行也一并写，
         便于对照。写入失败不影响主流程。
+
+        为什么是追加而不是覆盖：用户报障时最需要的恰恰是「上一次运行到哪一步、
+        为什么没出结果」，而覆盖式写入会在下次启动的瞬间把这份证据抹掉
+        （崩溃详情另有 XiangQiLens_crash.log，但那里没有正常流程的轨迹）。
+        文件超过 ``_LOG_MAX_BYTES`` 时轮转成 ``XiangQiLens.log.1``，只留一份。
         """
         try:
             base = Path(_sys.executable).resolve().parent if getattr(_sys, "frozen", False) else HERE
             p = base / "XiangQiLens.log"
-            fh = open(p, "w", encoding="utf-8", buffering=1)
+            try:
+                if p.is_file() and p.stat().st_size > Worker._LOG_MAX_BYTES:
+                    old = p.with_suffix(p.suffix + ".1")
+                    old.unlink(missing_ok=True)
+                    p.replace(old)
+            except Exception:
+                pass                          # 轮转失败不影响本次写入
+            fh = open(p, "a", encoding="utf-8", buffering=1)
+            fh.write("\n" + "=" * 60 + "\n")
             fh.write(f"XiangQiLens 运行日志  {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             fh.write(f"版本: v{__version__}\n")
             fh.write(f"模式: {'打包 exe' if getattr(_sys, 'frozen', False) else '源码'}\n")
@@ -467,6 +491,18 @@ class Worker(QObject):
             self.engine_options.emit(parse_engine_options(self._engine.option_lines))
         except Exception as exc:
             self.error.emit(f"引擎启动失败: {exc}")
+            self.done.emit()
+            return
+
+        # ★ 竞态守卫：GUI 线程可能在上面「加载识别模型」（按本函数开头的注释，
+        #   首次要 10~30 秒）期间就调过 shutdown() 了。那时 self._engine 还是
+        #   None，shutdown() 什么也没关 —— 刚创建的这个引擎必须在这里自己收掉，
+        #   否则它会成为孤儿进程（关窗口后仍在任务管理器里常驻，并与当前引擎
+        #   抢 CPU / 内存，让同样 movetime 的搜索少算好几层）。
+        if not self._run:
+            self._log("启动期间已收到停止请求，关闭刚创建的引擎")
+            self._dispose_engine(self._engine)
+            self._engine = None
             self.done.emit()
             return
 
@@ -705,6 +741,12 @@ class Worker(QObject):
         # "SQLite objects created in a thread can only be used in that same thread"
         # （被 except 吞掉，表现为连接泄漏）。
         self._close_book()
+        # ★ 引擎也在这里收掉，不再依赖 GUI 线程调用 shutdown()：
+        #   closeEvent 的 thread.wait(3000) 超时后**不会等我们**，而它的
+        #   shutdown() 是在 self._engine 仍为 None 时跑的 —— 什么也没关。
+        #   「谁创建谁销毁」才是结构性保证，见 tools/test_engine_lifecycle.py。
+        self._dispose_engine(self._engine)
+        self._engine = None
         self.done.emit()
 
     def stop(self) -> None:
@@ -841,6 +883,14 @@ class Worker(QObject):
             self.status.emit("引擎已重启")
         except Exception as exc:
             self.error.emit(f"引擎重启失败: {exc}")
+            self._engine = None
+            return
+        # ★ 同 run() 里的竞态守卫：GUI 线程可能在 create_engine（要加载 nnue，
+        #   本身就要几秒）期间就调过 shutdown() 了，那时 self._engine 是 None。
+        #   不在这里收掉的话，这个新进程同样会成为孤儿。
+        if not self._run:
+            self._log("重建期间已收到停止请求，关闭刚创建的引擎")
+            self._dispose_engine(self._engine)
             self._engine = None
             return
         # 重建成功后立刻恢复对当前局面的分析，否则面板会一直空着
@@ -1194,7 +1244,8 @@ class Worker(QObject):
         if self._clicker is None:
             self._clicker = MouseClicker(mode=self.auto_click_mode,
                                          move_steps=self.auto_move_steps,
-                                         restore_cursor=self.auto_restore_cursor)
+                                         restore_cursor=self.auto_restore_cursor,
+                                         backend=self.auto_backend)
         # 硬闸门：目标窗口必须在前台，且两个落点都在该窗口上
         if not ensure_foreground(hwnd):
             self.status.emit("无法将目标窗口置前，跳过本次自动走棋")
@@ -1230,6 +1281,7 @@ class Worker(QObject):
         self.auto_think_ms = max(100, int(p.get("think_ms", self.auto_think_ms)))
         self.auto_dry_run = bool(p.get("dry_run", self.auto_dry_run))
         self.auto_click_mode = p.get("click_mode", self.auto_click_mode)
+        self.auto_backend = p.get("backend", self.auto_backend)
         self.auto_cooldown = float(p.get("cooldown", self.auto_cooldown))
         self.auto_max_moves = max(1, int(p.get("max_moves", self.auto_max_moves)))
         self.auto_restore_cursor = bool(
@@ -1241,11 +1293,13 @@ class Worker(QObject):
         if self.auto_move_enabled and self._clicker is None:
             self._clicker = MouseClicker(mode=self.auto_click_mode,
                                          move_steps=self.auto_move_steps,
-                                         restore_cursor=self.auto_restore_cursor)
+                                         restore_cursor=self.auto_restore_cursor,
+                                         backend=self.auto_backend)
         elif self._clicker is not None:
             self._clicker.mode = self.auto_click_mode
             self._clicker.move_steps = self.auto_move_steps
             self._clicker.restore_cursor = self.auto_restore_cursor
+            self._clicker.backend = self.auto_backend
 
         if self.auto_move_enabled and not prev:
             # 刚开启：清掉上一局的计数/状态
@@ -1897,7 +1951,13 @@ class MainWindow(QMainWindow):
         self.spin_hash.setValue(256)
         self.spin_multipv = QSpinBox()
         self.spin_multipv.setRange(1, 8)
-        self.spin_multipv.setValue(3)
+        # 默认 1 = 最强单线。调高只在你人工看候选变化时有意义 ——
+        # MultiPV 会把同一份思考时间摊给多条线，自动走棋要用的第一条会变浅。
+        self.spin_multipv.setValue(1)
+        self.spin_multipv.setToolTip(
+            "1 = 最强单线（自动走棋推荐）\n"
+            ">1 = 同时给出多条候选变化，但每条都更浅：\n"
+            "实测 1200ms 下中局由深度 32 降到 23")
         self.spin_overhead = QSpinBox()
         self.spin_overhead.setRange(0, 5000)
         self.spin_overhead.setSingleStep(10)
@@ -2269,6 +2329,14 @@ class MainWindow(QMainWindow):
             "两次点击：点起点选子 → 点终点落子（多数象棋界面支持）。\n"
             "拖拽：按住起点拖到终点（部分界面只认这种）。")
 
+        self.combo_backend = QComboBox()
+        self.combo_backend.addItem("mouse_event（默认）", "mouse_event")
+        self.combo_backend.addItem("SendInput（部分界面更可靠）", "sendinput")
+        self.combo_backend.setToolTip(
+            "鼠标注入方式。默认 mouse_event 对多数象棋界面有效；\n"
+            "若落子点了没反应（常见于 CEF / 微信小程序类界面），\n"
+            "换成 SendInput 再试。两者都是纯 Win32 用户态调用。")
+
         self.spin_auto_cooldown = QDoubleSpinBox()
         self.spin_auto_cooldown.setRange(0.0, 10.0)
         self.spin_auto_cooldown.setSingleStep(0.5)
@@ -2308,15 +2376,17 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.spin_auto_think, 3, 1)
         grid.addWidget(QLabel("落子方式"), 4, 0)
         grid.addWidget(self.combo_click_mode, 4, 1)
-        grid.addWidget(QLabel("落子冷却"), 5, 0)
-        grid.addWidget(self.spin_auto_cooldown, 5, 1)
-        grid.addWidget(QLabel("最大连续走子"), 6, 0)
-        grid.addWidget(self.spin_auto_max, 6, 1)
-        grid.addWidget(QLabel("移动插值步数"), 7, 0)
-        grid.addWidget(self.spin_steps, 7, 1)
-        grid.addWidget(self.chk_restore, 8, 0, 1, 2)
-        grid.addWidget(self.btn_auto_stop, 9, 0, 1, 2)
-        grid.addWidget(self.lbl_auto_last, 10, 0, 1, 2)
+        grid.addWidget(QLabel("鼠标注入"), 5, 0)
+        grid.addWidget(self.combo_backend, 5, 1)
+        grid.addWidget(QLabel("落子冷却"), 6, 0)
+        grid.addWidget(self.spin_auto_cooldown, 6, 1)
+        grid.addWidget(QLabel("最大连续走子"), 7, 0)
+        grid.addWidget(self.spin_auto_max, 7, 1)
+        grid.addWidget(QLabel("移动插值步数"), 8, 0)
+        grid.addWidget(self.spin_steps, 8, 1)
+        grid.addWidget(self.chk_restore, 9, 0, 1, 2)
+        grid.addWidget(self.btn_auto_stop, 10, 0, 1, 2)
+        grid.addWidget(self.lbl_auto_last, 11, 0, 1, 2)
         outer.addWidget(body)
 
         body.setVisible(False)
@@ -2329,6 +2399,7 @@ class MainWindow(QMainWindow):
             w.valueChanged.connect(self._on_auto_changed)
         self.spin_auto_cooldown.valueChanged.connect(self._on_auto_changed)
         self.combo_click_mode.currentIndexChanged.connect(self._on_auto_changed)
+        self.combo_backend.currentIndexChanged.connect(self._on_auto_changed)
         self.chk_restore.toggled.connect(self._on_auto_changed)
         return grp
 
@@ -2362,6 +2433,7 @@ class MainWindow(QMainWindow):
             "dry_run": mode != "real",
             "mode": mode,
             "click_mode": self.combo_click_mode.currentData() or "two_click",
+            "backend": self.combo_backend.currentData() or "mouse_event",
             "cooldown": float(self.spin_auto_cooldown.value()),
             "max_moves": self.spin_auto_max.value(),
             "restore_cursor": self.chk_restore.isChecked(),
@@ -2445,6 +2517,7 @@ class MainWindow(QMainWindow):
             return
         widgets = (self.radio_off, self.radio_dry, self.radio_real,
                    self.spin_auto_think, self.combo_click_mode,
+                   self.combo_backend,
                    self.spin_auto_cooldown, self.spin_auto_max,
                    self.chk_restore, self.spin_steps)
         for w in widgets:
@@ -2463,6 +2536,10 @@ class MainWindow(QMainWindow):
                 str(data.get("click_mode", "two_click")))
             if idx >= 0:
                 self.combo_click_mode.setCurrentIndex(idx)
+            idx = self.combo_backend.findData(
+                str(data.get("backend", "mouse_event")))
+            if idx >= 0:
+                self.combo_backend.setCurrentIndex(idx)
             self.spin_auto_cooldown.setValue(float(data.get("cooldown", 1.5)))
             self.spin_auto_max.setValue(int(data.get("max_moves", 200)))
             self.chk_restore.setChecked(bool(data.get("restore_cursor", False)))
@@ -2774,6 +2851,7 @@ class MainWindow(QMainWindow):
         self.worker.auto_think_ms = auto["think_ms"]
         self.worker.auto_dry_run = auto["dry_run"]
         self.worker.auto_click_mode = auto["click_mode"]
+        self.worker.auto_backend = auto["backend"]
         self.worker.auto_cooldown = auto["cooldown"]
         self.worker.auto_max_moves = auto["max_moves"]
         self.worker.auto_restore_cursor = auto["restore_cursor"]
@@ -2839,11 +2917,17 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def on_done(self) -> None:
-        if self.worker:
-            self.worker.shutdown()
+        # ★ 顺序很重要：先确认线程真的停了，再去动 worker 的内部状态。
+        #   run() 自己已经收掉了引擎（见 run() 尾部），这里的 shutdown() 只负责
+        #   关日志 / 开局库；但若线程还在收尾就贸然调用，仍会踩到它正在用的状态。
+        stopped = True
         if self.thread:
             self.thread.quit()
-            self.thread.wait(3000)
+            stopped = self.thread.wait(3000)
+        if self.worker and stopped:
+            self.worker.shutdown()
+        elif self.worker:
+            self.statusBar().showMessage("识别线程仍在收尾，稍后自行完成清理…")
         self.worker = None
         self.thread = None
         self.btn_run.setText("分析")
@@ -2861,8 +2945,18 @@ class MainWindow(QMainWindow):
         self.stop()
         if self.thread:
             self.thread.quit()
-            self.thread.wait(3000)
-        # 线程已停，再确保引擎子进程被关掉（否则会留下孤儿进程）
+            if not self.thread.wait(5000):
+                # ★ 线程还在跑（例如正卡在「加载识别模型 10~30 秒」上）。
+                #   这时**绝不能**调 worker.shutdown()：它在 self._engine 仍为
+                #   None 时跑完什么也没关，而 run() 之后才创建引擎 —— 抢在前面
+                #   等于放走一个进程。run() 自己会在退出路径上关掉引擎
+                #   （见 run() 尾部与 _rebuild_engine 的 _run 守卫），
+                #   另外 engine_client 的 Job Object 保证本进程一退出、
+                #   其子进程必被内核终止，所以这里可以安全退出。
+                self.statusBar().showMessage("识别线程仍在收尾，引擎将随本程序一起退出")
+                ev.accept()
+                return
+        # 线程确已停止，才去动 worker 的内部状态
         if self.worker:
             self.worker.shutdown()
         ev.accept()

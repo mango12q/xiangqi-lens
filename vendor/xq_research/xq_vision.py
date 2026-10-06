@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -205,13 +206,33 @@ class XiangqiVision:
         return "/".join(board) + f" {side_to_move} - - 0 1"
 
 
+def _default_research() -> Path:
+    """尽力定位含 ``hf_model`` 的 ``xq_research`` 目录（不依赖 app_backend）。
+
+    本模块是**独立可运行**的（``python xq_vision.py 图片.png``），所以不能
+    import app_backend 来拿路径。原来这里硬编码了开发机的
+    ``D:\\opencode\\xq_research\\...``，换台机器直接失效。
+    """
+    here = Path(__file__).resolve().parent
+    for base in (here.parent, here.parent.parent, Path.cwd(),
+                 Path.cwd().parent):
+        cand = base / "xq_research"
+        if (cand / "hf_model").is_dir():
+            return cand
+    return here.parent.parent / "xq_research"       # 兜底：让报错指出缺什么
+
+
 def main():
+    research = _default_research()
     ap = argparse.ArgumentParser()
     ap.add_argument("images", nargs="+")
-    ap.add_argument("--pose", default=r"D:\opencode\xq_research\hf_model\onnx\pose\4_v6-0301.onnx")
-    ap.add_argument("--cls", default=r"D:\opencode\xq_research\hf_model\onnx\layout_recognition\nano_v3-0319.onnx")
+    ap.add_argument("--pose", default=str(
+        research / "hf_model" / "onnx" / "pose" / "4_v6-0301.onnx"))
+    ap.add_argument("--cls", default=str(
+        research / "hf_model" / "onnx" / "layout_recognition"
+        / "nano_v3-0319.onnx"))
     ap.add_argument("--cpu", action="store_true", help="强制 CPU")
-    ap.add_argument("--save", default=r"D:\opencode\xq_research\shots\vision")
+    ap.add_argument("--save", default=str(research / "shots" / "vision"))
     args = ap.parse_args()
 
     import os

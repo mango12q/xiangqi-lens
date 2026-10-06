@@ -1,0 +1,46 @@
+name: tests
+
+# 只有 Windows 能跑：截图（PrintWindow）、DPI 感知、窗口状态检测都依赖 Win32 API。
+#
+# 这里**不需要**识别模型与 Pikafish 引擎 —— 它们在仓库外（各约 40MB / 55MB，
+# 且各有许可证）。缺它们的测试会明确打印 [跳过] 并返回 0，见 tools/_common.py。
+# 所以本 workflow 在没有这些资源的情况下也应当是**绿的**。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: 语法与导入检查
+        run: |
+          python -m compileall -q app_vision.py app_backend.py app_book.py app_input.py vendor/xq_research tools
+          python -c "import app_vision, app_backend, app_book, app_input; print('导入 OK')"
+
+      - name: 跑测试（通过 / 跳过 / 失败 三类汇总）
+        run: python tools/run_tests.py
+
+      - name: 自检（资源缺失时也应给出明确原因）
+        run: python app_vision.py --selftest
+        continue-on-error: true

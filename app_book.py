@@ -234,24 +234,108 @@ def _norm_entries(entries) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# SQLite 后端的公共部分
+# ---------------------------------------------------------------------------
+# xqb 与 obk 的差异只有两点：**怎么算 key**、**怎么解着法**。
+# 其余（只读打开、结果行 → 条目、权重算法、按局面缓存、关闭连接）逐字相同，
+# 原来在两个类里各写了一遍 —— 改一处漏一处是必然的。
+def _open_ro(path: str | Path) -> sqlite3.Connection:
+    """只读打开 SQLite 库。
+
+    ★ ``uri=True`` + ``mode=ro``：绝不能误写用户的库文件。
+
+    注意这里**不设** ``text_factory`` —— 两个后端的取文本需求不同：
+    xqb 需要按 bytes 取（``information`` 表里可能有非 UTF-8 字节），
+    obk 则需要默认的 str（``_find_table`` 要拿表名去拼 ``PRAGMA``）。
+    各自在 ``__init__`` 里按需设置，保持原有语义。
+    """
+    p = Path(str(path))
+    if not p.is_file():
+        raise FileNotFoundError(str(path))
+    return sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True)
+
+
+def _weight_of(win, draw, score) -> int:
+    """胜/和/分 → 权重。
+
+    优先「胜局 * 2 + 和局」（胜率代理），无统计时退到 ``score``，再退到 1。
+    """
+    try:
+        w = int(win or 0) * 2 + int(draw or 0)
+        if w <= 0:
+            w = int(score or 0)
+        return w if w > 0 else 1
+    except Exception:
+        return 1
+
+
+def _entries_from_rows(rows, decode_move) -> list[dict]:
+    """把 ``(move, win, draw, lost, score, valid)`` 结果行归一成条目列表。
+
+    ``valid == 0`` 表示该条被标记为无效，直接丢弃。
+    """
+    out: list[dict] = []
+    for row in rows or []:
+        move, win, draw, _lost, score, valid = (list(row) + [None] * 6)[:6]
+        try:
+            if valid is not None and int(valid) == 0:
+                continue
+        except Exception:
+            pass
+        try:
+            mv = decode_move(int(move))
+        except Exception:
+            mv = None
+        if not mv:
+            continue
+        out.append({"move": mv, "weight": _weight_of(win, draw, score)})
+    return out
+
+
+class _CachedSqliteBook:
+    """按局面缓存查询结果的公共基类。
+
+    缓存上界 512：开局库的命中集中在开局，几百个局面足够；不设上界则长局会
+    一直涨（局面 key 每个都不同）。
+    """
+
+    kind = "?"
+    _CACHE_MAX = 512
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = str(path)
+        self.conn = _open_ro(path)
+        self._cache: dict[str, list[dict]] = {}
+
+    def _cached(self, key: str):
+        """命中返回列表（**可能是空列表**，那也是有效结果）；未命中返回 None。"""
+        return self._cache.get(key)
+
+    def _store(self, key: str, value: list[dict]) -> None:
+        if len(self._cache) > self._CACHE_MAX:
+            self._cache.clear()
+        self._cache[key] = value
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # 后端 1：xqb（SQLite）
 # ---------------------------------------------------------------------------
-class XqbBook:
+class XqbBook(_CachedSqliteBook):
     """xqb 开局库：按 key 精确查询，不整库载入内存。"""
 
     kind = "xqb"
 
     def __init__(self, path: str | Path) -> None:
-        self.path = str(path)
-        p = Path(self.path)
-        if not p.is_file():
-            raise FileNotFoundError(self.path)
-        # ★ 只读打开（uri=True + mode=ro）：绝不能误写用户的库文件。
-        self.conn = sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True)
+        super().__init__(path)
         # information 表的 value 是 TEXT；统一按 bytes 取，自己解码，
         # 避免历史库里混入非 UTF-8 字节时直接抛异常。
         self.conn.text_factory = bytes
-        self._cache: dict[str, list[dict]] = {}
         self._info = self._read_info()
         if not self._has_book_table():
             raise ValueError(f"不是 xqb 开局库（缺 book 表）: {self.path}")
@@ -286,13 +370,13 @@ class XqbBook:
 
     def probe(self, fen: str) -> list[dict]:
         board = board_of(fen)
-        if board in self._cache:
-            return self._cache[board]
+        hit = self._cached(board)
+        if hit is not None:
+            return hit
         try:
             key = xqb_encode_key(board)
         except Exception:
             return []
-        rows = []
         try:
             rows = self.conn.execute(
                 "select move, win, draw, lost, score, valid from book "
@@ -300,32 +384,9 @@ class XqbBook:
         except Exception:
             rows = []
 
-        out: list[dict] = []
-        for row in rows:
-            move, win, draw, lost, score, valid = (list(row) + [None] * 6)[:6]
-            if valid is not None and int(valid) == 0:
-                continue
-            mv = xqb_decode_move(int(move))
-            if not mv:
-                continue
-            # 权重：优先「胜局*2 + 和局」（胜率代理），无统计时退到 score，再退到 1
-            weight = int(win or 0) * 2 + int(draw or 0)
-            if weight <= 0:
-                weight = int(score or 0)
-            if weight <= 0:
-                weight = 1
-            out.append({"move": mv, "weight": weight})
-
-        if len(self._cache) > 512:
-            self._cache.clear()
-        self._cache[board] = out
+        out = _entries_from_rows(rows, xqb_decode_move)
+        self._store(board, out)
         return out
-
-    def close(self) -> None:
-        try:
-            self.conn.close()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +567,7 @@ def obk_encode_move(iccs: str) -> int:
     return (offset(iccs[0], iccs[1]) << 8) | offset(iccs[2], iccs[3])
 
 
-class ObkBook:
+class ObkBook(_CachedSqliteBook):
     """obk 开局库（社区实际流通的格式，SQLite）。
 
     表结构::
@@ -527,16 +588,10 @@ class ObkBook:
     kind = "obk"
 
     def __init__(self, path: str | Path) -> None:
-        self.path = str(path)
-        p = Path(self.path)
-        if not p.is_file():
-            raise FileNotFoundError(self.path)
-        # 只读打开，绝不误写用户的库文件
-        self.conn = sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True)
+        super().__init__(path)
         self.table = self._find_table()
         if not self.table:
             raise ValueError(f"不是 obk 开局库（找不到含 vkey/vmove 的表）: {self.path}")
-        self._cache: dict[str, list[dict]] = {}
         try:
             self.rows = int(self.conn.execute(
                 f'SELECT COUNT(*) FROM "{self.table}"').fetchone()[0])
@@ -568,8 +623,9 @@ class ObkBook:
     def probe(self, fen: str) -> list[dict]:
         # ★ 缓存键用**完整 FEN**：obk 的 Zobrist 含轮次，同一布局在红/黑轮次
         #   下是不同的键、命中的着法也不同，只用棋盘段做键会串味。
-        if fen in self._cache:
-            return self._cache[fen]
+        hit = self._cached(fen)
+        if hit is not None:
+            return hit
         try:
             key = obk_zhash(fen)
         except Exception:
@@ -591,31 +647,9 @@ class ObkBook:
         except Exception:
             rows = []
 
-        out: list[dict] = []
-        for row in rows:
-            move, win, draw, lost, score, valid = (list(row) + [None] * 6)[:6]
-            if valid is not None and int(valid) == 0:
-                continue
-            mv = obk_decode_move(int(move))
-            if not mv:
-                continue
-            weight = int(win or 0) * 2 + int(draw or 0)
-            if weight <= 0:
-                weight = int(score or 0)
-            if weight <= 0:
-                weight = 1
-            out.append({"move": mv, "weight": weight})
-
-        if len(self._cache) > 512:
-            self._cache.clear()
-        self._cache[fen] = out
+        out = _entries_from_rows(rows, obk_decode_move)
+        self._store(fen, out)
         return out
-
-    def close(self) -> None:
-        try:
-            self.conn.close()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------

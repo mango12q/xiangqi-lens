@@ -1,0 +1,24 @@
+# XiangQiLens 运行时依赖
+#
+# 安装：
+#     pip install -r requirements.txt
+#
+# ★ onnxruntime 有两个发行版，**只能装一个**，性能差 5~7 倍：
+#     onnxruntime-directml  Windows + 任意显卡（推荐）
+#     onnxruntime           纯 CPU（慢；即使代码里请求 CUDA 也会静默降级）
+#   实测 683x1253 单帧推理：CPU 版约 980ms，DirectML 版约 116ms。
+#   因此下面**故意不写** onnxruntime，请在装完本文件后二选一：
+#     pip install onnxruntime-directml      # 推荐
+#     pip install onnxruntime               # 无独显/无 DirectML 时
+#
+# 平台：Windows 10/11 64 位（截图、DPI、窗口状态检测都依赖 Win32 API）。
+# 开发环境实测版本见行尾注释。
+
+PySide6>=6.6                 # 6.11.2 —— 界面
+opencv-python>=4.8           # 5.0.0.93 —— 图像处理 / 透视变换
+numpy>=1.24                  # 2.5.3
+mss>=9.0                     # 10.2.0 —— 前台抓屏兜底
+pywin32>=306                 # 312 —— win32gui / win32ui 后台截图
+cchess>=1.2                  # 1.25.5 —— 棋规校验 / 中文着法
+
+# onnxruntime 见上方说明，二选一安装，不要写在这里。

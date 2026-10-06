@@ -33,7 +33,7 @@
 | **后台截图** | 用 `PrintWindow` + `PW_RENDERFULLCONTENT` 截取窗口，**不要求窗口可见、可被遮挡**；失败时自动回退到屏幕抓取 |
 | **棋盘识别** | 两段式 ONNX：棋盘 4 角定位（pose）→ 透视拉正 → 90 格分类 |
 | **走法箭头** | 直接画在棋盘上：绿色粗箭头是最佳着法，蓝色细箭头是候选变化 |
-| **多主变例 (MultiPV)** | 引擎真实 MultiPV：同时列出 N 条主变例（分数 / 胜率 / 深度 / 中文 / ICCS），各线首着在棋盘上以蓝色细箭头标出 |
+| **多主变例 (MultiPV)** | 引擎真实 MultiPV：同时列出 N 条主变例（分数 / 胜率 / 深度 / 中文 / ICCS），各线首着在棋盘上以蓝色细箭头标出。**默认 1**（见下方说明） |
 | **引擎参数面板** | Threads / Hash / MultiPV / Move Overhead / WDL 开关可实时热改，改动立刻作用于正在跑的分析；「高级」区动态列出引擎全部可调项 |
 | **持续加深** | 锁定局面后 `go infinite` 持续加深，主变例随深度实时刷新（不重传棋盘图像，开销很小） |
 | **崩溃自愈** | 引擎进程意外退出时自动重建并用当前局面重开搜索，分析不中断 |
@@ -65,15 +65,19 @@
 
 ### 方式 B：从源码运行
 
-需要 Python 3.10+（开发环境为 3.13）。推荐用 DirectML 版 onnxruntime 走 GPU：
+需要 Python 3.10+（开发环境为 3.13）：
 
 ```bash
-pip install PySide6 opencv-python numpy mss pywin32 cchess
-pip install onnxruntime-directml     # Windows + 任意显卡；纯 CPU 用 onnxruntime
+pip install -r requirements.txt
+pip install onnxruntime-directml     # Windows + 任意显卡（推荐）
+# 或 pip install onnxruntime         # 纯 CPU，慢很多
 ```
 
-> **性能差异很大**：默认的 `onnxruntime` 是 CPU 版，即使代码里请求 CUDA 也会静默降级。
-> 实测识别耗时 CPU 版约 980ms/帧，DirectML 版约 170ms/帧。详见下文「性能」。
+> `requirements.txt` 里**故意不写** `onnxruntime` —— 它有两个发行版且只能装一个，
+> 性能差 5~7 倍，所以留给你按机器二选一（文件里有详细说明）。
+
+> **性能差异很大**：CPU 版 `onnxruntime` 即使代码里请求 CUDA 也会静默降级。
+> 实测识别耗时 CPU 版约 980ms/帧，DirectML 版约 116ms/帧。详见下文「性能」。
 
 然后下载模型与引擎（见下节），再运行：
 
@@ -217,11 +221,30 @@ DirectML 版还显著更稳：CPU 版 p90/中位 = 1.35（偶发 1170ms 尖峰�
 
 > 首帧有约 **3 秒预热**（DirectML 编译着色器），之后才进入稳定速度。
 
+**单帧里除了推理还有别的开销**，抓帧校验曾经是大头（对整幅截图做
+`astype(np.float32)` 只为判断「不是全黑」，实测 683×1253 要 26.3ms，占单帧 23%）——
+现已改成 8 倍抽样，同一判据下只要 0.30ms。BGRA→BGR 也从花式索引改成了
+`cv2.cvtColor`（3.23ms → 0.59ms）。详见
+`deliverables/engineering-assurance/optimization-review-round3-2026-10-06.md`。
+
 确认当前用的哪个 provider：
 
 ```bash
 python tools/bench_vision.py --runs 20
 ```
+
+### MultiPV 与棋力
+
+**默认是 1（最强单线）。** MultiPV 不是「多搜几条线」，而是把同一份思考时间
+**摊**给 N 条主变例，每条都更浅 —— 而自动走棋要走的正是第一条。本机实测
+（`go movetime 1200`、Threads 2、Hash 256）：
+
+| 局面 | MultiPV=1 | MultiPV=3 | 深度差 |
+|---|---|---|---|
+| 开局 | 深度 22 | 深度 20 | −2 层 |
+| 中局 | 深度 32 | 深度 23 | **−9 层** |
+
+所以要**看候选变化 / 复盘研究**时到面板里手动调高；**要下棋就留在 1**。
 
 ---
 
@@ -234,13 +257,17 @@ XiangQiLens/
 ├── app_input.py               鼠标注入（自动走棋用）
 ├── app_book.py                开局库（xqb 位级编解码 + 线路库 + 统一查询）
 ├── 启动XiangQiLens.bat         无窗口启动器（双击即用；加 debug 参数走控制台）
+├── requirements.txt           运行时依赖（onnxruntime 二选一，见文件内说明）
+├── requirements-dev.txt       开发/测试依赖（CPU 版 onnxruntime + PyInstaller + Pillow）
+├── assets/icon.ico            应用图标（**仓库自有**，由 tools/make_icon.py 生成）
 │
+├── .github/workflows/tests.yml  CI（Windows；不需要模型与引擎也应当是绿的）
 ├── tools/                     诊断与验证脚本，见下表
 ├── data/                      开局库（opening.xqb，由 tools/build_book.py 生成）
 │
 ├── vendor/xq_research/        **入库的运行时模块**（app_backend 直接 import）
 │   ├── xq_vision.py           两段式 ONNX 识别管线（pose + 90 格分类）
-│   └── engine_client.py       UCI 引擎客户端（子进程 + 读线程）
+│   └── engine_client.py       UCI 引擎客户端（子进程 + 读线程 + Job Object）
 │
 └── src/                       另一套自研识别实现（探索性质，保留作为参考）
     ├── xiangqi.py             棋盘表示、FEN 转换、规则校验
@@ -284,6 +311,24 @@ XiangQiLens/
 | `verify_repo.py` | 发布自检：检查远程仓库信息、README 图片可访问性、关键文件可达性 |
 | `make_shot.py` / `compress_docs.py` | 合成与压缩 README 展示图 |
 | `analyze_board.py` / `detect_lines.py` / ... | 自研路线的调参与诊断工具 |
+| **`run_tests.py`** | **跑遍 `test_*.py` 并汇总成「通过 / 跳过 / 失败」三类**（`-k` 过滤、`-v` 看输出）；CI 用的就是它 |
+| **`_common.py`** | 测试脚本的公共脚手架：路径引导、窗口查找、资源可用性、`skip()`、`Checker` |
+| **`test_engine_lifecycle.py`** | 引擎生命周期：启动期间收到停止 → 新建引擎必须就地关闭（防孤儿进程）；日志追加与轮转 |
+| **`test_build_chain.py`** | 打包链路回归：`--paths` 必须指 `vendor/`、代码资产缺失硬失败、冒烟测试必须见到 `[通过]`、图标不得指向别的仓库 |
+| **`test_gui_smoke.py`** | 离屏界面冒烟：主窗口可构造、MultiPV 默认 1、「鼠标注入」贯通到 Worker / MouseClicker |
+| **`make_icon.py`** | 生成 `assets/icon.ico`（原创绘制，多尺寸）。图标是构建产物，生成方式一并入库才能重现 |
+
+### 测试约定：环境不具备 ≠ 代码回归
+
+一批测试需要**真实对局窗口**或**模型与引擎**（它们不在仓库里）。这类情况一律
+打印 `[跳过]` 并 **`return 0`**（见 `tools/_common.py` 的 `skip()`）——
+绝不算失败。理由很实际：假红比没有 CI 更糟，它会训练维护者忽略 CI 失败。
+
+```bash
+python tools/run_tests.py          # 通过 22 / 跳过 6 / 失败 0（本机无对局窗口时的实测）
+```
+
+CI 见 `.github/workflows/tests.yml`（Windows runner，不需要模型与引擎也应当是绿的）。
 
 ---
 
@@ -419,6 +464,7 @@ Per-Monitor V2 DPI 感知，无需缩放换算。
 |---|---|---|
 | 思考时间 | 1200 ms | 自动走棋专用，强制**限时搜索**（`go infinite` 永不返回确定着法，无法用于落子） |
 | 落子方式 | 两次点击 | 点起点选子 → 点终点落子；部分界面只认「拖拽」时可切换 |
+| 鼠标注入 | `mouse_event` | 另一种是 `SendInput`。落子点了没反应时（常见于 CEF / 微信小程序类界面）换它再试；两者都是纯 Win32 用户态调用 |
 | 落子冷却 | 1.5 s | 两次落子最小间隔 |
 | 最大连续走子 | 200 | 保险丝，达到后自动停止 |
 | 移动插值步数 | 1 | 光标移动步数；界面要求「悬停」才响应时可调到 4~8 |
