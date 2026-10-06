@@ -79,6 +79,16 @@ def fired(w: Worker) -> bool:
 def main() -> int:
     print("=== 自动走棋闸门单元测试（预览模式，不点击）===")
 
+    # 本测试需要一个**真实窗口**当 source.hwnd 的替身（门槛逻辑里会调
+    # window_state / is_point_on_window）。桌面上一个可用窗口都没有时
+    # （例如全部落在窗口黑名单里）明确**跳过**，而不是报失败 —— 这是环境
+    # 依赖，不是代码问题。
+    enable_dpi_awareness()
+    if not ScreenSource.list_windows(50):
+        print("  [跳过] 当前桌面没有可用窗口（全被窗口黑名单过滤）。")
+        print("         打开任意普通程序窗口（或象棋窗口）后重跑即可。")
+        return 0
+
     # 1. 轮到我方 + 起点是我方棋子 → 应当触发
     w = make_worker()
     w._pump_auto_move()
