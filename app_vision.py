@@ -2235,7 +2235,9 @@ class MainWindow(QMainWindow):
 
         # 走棋模式：三态**互斥**（关闭 / 预览 / 真点）。
         # 需求要求「选其中一个另一个选不上」，所以用 QButtonGroup 做单选，
-        # 而不是两个可以同时勾上的复选框。默认「关闭」，最安全。
+        # 而不是两个可以同时勾上的复选框。
+        # ★ 默认是「启动走棋（真点落子）」—— 见下面的 radio_real.setChecked(True)，
+        #   与 README「自动走棋（默认开启）」一致；**不是**「关闭」。
         self.radio_off = QRadioButton("关闭自动走棋")
         self.radio_dry = QRadioButton("预览模式（只算不点）")
         self.radio_dry.setToolTip(
@@ -2426,8 +2428,13 @@ class MainWindow(QMainWindow):
     def _load_auto_config(self) -> None:
         """读取 automove.json 回填面板。
 
-        **刻意不持久化「启用」开关** —— 每次启动都从关闭状态开始，
-        避免上次退出时开着、下次一启动就开始点鼠标。
+        **走棋模式是会持久化的**（``mode`` 键：``off`` / ``dry`` / ``real``）——
+        上次退出时存的是「真点」，本次启动就仍然是「真点」，会真的点鼠标。
+
+        ``_save_auto_config`` 里 pop 掉的 ``enabled`` 只是个派生字段
+        （``enabled == (mode != "off")``），去掉它并不改变实际状态：真正决定
+        开关的是 ``mode``。配置文件不存在、或旧配置缺 ``mode`` 键时落到
+        「真点」（见下方 ``data.get("mode", "real")``）。
         """
         try:
             p = self._auto_cfg_path()
@@ -2443,8 +2450,8 @@ class MainWindow(QMainWindow):
         for w in widgets:
             w.blockSignals(True)
         try:
-            # ★ 启动一律回到安全态：即使上次存的是「真点」，本次也只恢复成
-            #   「预览」，绝不因为读了个配置文件就开始点鼠标。
+            # ★ 模式按配置**原样恢复**：上次存的是「真点」，本次启动就仍是「真点」，
+            #   会真的点鼠标 —— 想只算不点，请把面板切到「预览模式」。
             # 默认「启动走棋（真点落子）」—— 按需求自动走棋默认开启。
             # 旧配置没有 mode 键时也落到真点。
             mode = str(data.get("mode", "real"))

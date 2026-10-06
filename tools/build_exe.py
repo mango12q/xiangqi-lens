@@ -26,7 +26,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent          # XiangQiLink/
-RESEARCH = ROOT.parent / "xq_research"                 # 资源目录
+RESEARCH = ROOT.parent / "xq_research"                 # 资源目录（模型/引擎，不入库）
+VENDOR = ROOT / "vendor" / "xq_research"               # 代码目录（入库，见 .gitignore 注释）
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
 APP_NAME = "XiangQiLens"
@@ -41,6 +42,19 @@ ASSETS = [
     "xq_vision.py",
     "engine_client.py",
 ]
+
+# 上面这两项是**代码**，仓库里有入库副本（vendor/）。打包一律优先用入库副本，
+# 否则会出现「发出去的 exe 跑的是 xq_research/ 里的未跟踪文件、跟仓库对不上」。
+CODE_ASSETS = ("xq_vision.py", "engine_client.py")
+
+
+def asset_src(rel: str) -> Path:
+    """返回某个待分发文件的来源路径（代码优先取 vendor/，资源只能取 xq_research/）。"""
+    if rel in CODE_ASSETS:
+        p = VENDOR / rel
+        if p.is_file():
+            return p
+    return RESEARCH / rel
 
 
 def run(cmd: list[str], **kw) -> int:
@@ -62,16 +76,16 @@ def check_env() -> bool:
 
     missing = []
     for rel in ASSETS:
-        p = RESEARCH / rel
+        p = asset_src(rel)
         if not p.is_file():
             missing.append(rel)
     if missing:
         print("    [失败] 缺少资源文件:")
         for m in missing:
-            print(f"           {RESEARCH / m}")
+            print(f"           {asset_src(m)}")
         print("           模型与引擎的获取方式见 README「依赖与准备」")
         return False
-    total = sum((RESEARCH / r).stat().st_size for r in ASSETS)
+    total = sum(asset_src(r).stat().st_size for r in ASSETS)
     print(f"    资源齐备，共 {total / 1024 / 1024:.1f} MB")
     return True
 
@@ -137,11 +151,11 @@ def stage_assets() -> bool:
 
     tgt = out / "xq_research"
     for rel in ASSETS:
-        src = RESEARCH / rel
+        src = asset_src(rel)
         dst = tgt / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
-        print(f"    {rel}  ({src.stat().st_size / 1024 / 1024:.1f} MB)")
+        print(f"    {rel}  ({src.stat().st_size / 1024 / 1024:.1f} MB)  <- {src.parent}")
 
     # 顺带放一份使用说明与许可，方便直接分发
     for extra in ("README.md", "LICENSE"):
