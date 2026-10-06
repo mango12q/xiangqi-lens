@@ -70,8 +70,19 @@ def _find_research() -> Path:
 
 
 RESEARCH = _find_research()
+
+# 代码目录：``xq_vision.py`` 与 ``engine_client.py`` 这两个**模块**随仓库入库
+# （见 ``vendor/xq_research/``），而模型与引擎等**资源**仍从 ``RESEARCH`` 查找。
+# 两者刻意分开：
+#   · 资源体积大（约 95MB）且各有许可证，不入库；
+#   · 代码不入库就等于没有历史 —— 2026-10-06 之前这两个文件从未被 git 跟踪过，
+#     只存在于 ``../xq_research/``（该目录被 .gitignore 排除且自身不是 git 仓库）。
+# 源码运行时 ``vendor/`` 优先；打包后这两个模块已编进 exe，这里只是兜底。
+VENDOR = HERE / "vendor" / "xq_research"
+
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(RESEARCH))
+sys.path.insert(0, str(VENDOR))          # 最后插入 = sys.path 优先级最高
 POSE_ONNX = RESEARCH / "hf_model" / "onnx" / "pose" / "4_v6-0301.onnx"
 CLS_ONNX = RESEARCH / "hf_model" / "onnx" / "layout_recognition" / "nano_v3-0319.onnx"
 ENGINE_EXE = RESEARCH / "pikafish" / "Pikafish-Windows-x86-64-universal.exe"

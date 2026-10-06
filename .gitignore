@@ -9,7 +9,12 @@ engines/
 
 # 识别模型（ONNX 权重，约 40MB）
 # 权重放在 xq_research/hf_model/ 下，按 README 说明下载
-xq_research/
+#
+# ★ 这条必须带前导 /，只锚定**仓库根目录**的 xq_research/（资源目录）。
+#   若写成不带 / 的 `xq_research/`，它会匹配任意层级下的同名目录，
+#   把 vendor/xq_research/ 一起忽略掉 —— 而那里放的是**必须入库的代码**
+#   （xq_vision.py / engine_client.py）。模型权重仍由下面的 *.onnx 兜底。
+/xq_research/
 hf_model/
 *.onnx
 
