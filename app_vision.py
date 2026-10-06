@@ -1828,50 +1828,74 @@ class MainWindow(QMainWindow):
         self._fill_pv_table(diag)
 
     # ---------------- 窗口列表 ----------------
+    # 自动选中棋局窗口的阈值：低于它视为"不像棋局窗口"，不自动选，交给用户手选。
+    # 取值依据（各项权重见 _window_score）：
+    #   天天象棋小程序（标题含"象棋" + 微信宿主 + CEF + 未最小化） = 170
+    #   JJ象棋 PC 端（含"象棋" + CEF + 未最小化）                  = 130
+    #   微信小程序宿主但标题不含"象棋"（普通小程序窗口）            =  70  ← 必须低于阈值
+    #   微信主窗口 / 记事本 / 其它普通窗口                          ≤  50
+    # 取 80 的效果：只有「标题里写了象棋」的窗口才会被自动选中。
+    WINDOW_SCORE_MIN = 80
+
+    @staticmethod
+    def _window_score(w: dict) -> int:
+        """给候选窗口打分，用于自动选中棋局窗口。
+
+        为什么用打分而不是「标题里有 JJ象棋」：除了 JJ象棋 PC 端，还有
+        天天象棋小程序（宿主进程 WeChatAppEx.exe / 窗口标题「天天象棋」）、
+        各类网页版棋局，硬编码单一标题会全部漏掉。
+        """
+        t = w.get("title") or ""
+        cls = w.get("class") or ""
+        proc = (w.get("proc") or "").lower()
+        s = 0
+        if "象棋" in t:
+            s += 100                     # 最强信号：标题里直接写了象棋
+        if proc in ("wechatappex.exe", "weixin.exe", "wechat.exe"):
+            s += 40                      # 微信 / 微信小程序宿主
+        if cls.startswith("Chrome_WidgetWin"):
+            s += 20                      # CEF / WebView 渲染窗口
+        if not w.get("minimized"):
+            s += 10
+        return s
+
     def refresh_windows(self) -> None:
         self.combo.clear()
         # 用 list_windows_any：包含最小化的窗口，这样用户把对局窗口
         # 最小化后依然能在列表里选到它（只是需要先还原才能识别）。
+        # 该函数已过滤系统壳 / 输入法 / 本程序自身的窗口。
         wins = list_windows_any(min_size=200)
         for w in wins:
             r = w["rect"]
             size = f"{r[2] - r[0]}x{r[3] - r[1]}"
             mark = "  [已最小化]" if w["minimized"] else ""
-            label = f"{w['title']}  [{w['class']}]  {size}{mark}"
+            proc = w.get("proc") or ""
+            proc_part = f"  {proc}" if proc else ""
+            label = f"{w['title']}  [{w['class']}]{proc_part}  {size}{mark}"
             self.combo.addItem(label, (w["hwnd"], w["title"]))
         if self.combo.count() == 0:
             self.combo.addItem("（未找到可用窗口）", None)
             return
 
-        # 优先选真正在对局的棋局窗口：标题带「JJ象棋 / 象棋」，且已还原
-        best = -1
-        for i, w in enumerate(wins):
-            if "JJ象棋" in w["title"] and not w["minimized"]:
-                best = i
-                break
-        if best < 0:
-            for i, w in enumerate(wins):
-                if "JJ象棋" in w["title"]:
-                    best = i
-                    break
-        if best < 0:
-            for i, w in enumerate(wins):
-                if "象棋" in w["title"] and not w["minimized"]:
-                    best = i
-                    break
+        # 自动选中得分最高的候选（棋局窗口），而不是只看标题里有没有「JJ象棋」
+        scored = [(self._window_score(w), i) for i, w in enumerate(wins)]
+        best_score, best = max(scored, key=lambda x: x[0])
+        if best_score < self.WINDOW_SCORE_MIN:
+            # 一个都不像棋局窗口：停在第一项但明确提示，别让用户误以为选好了
+            self.combo.setCurrentIndex(0)
+            self.statusBar().showMessage(
+                "未自动找到棋局窗口，请在下拉框里手动选择对局窗口"
+                "（通常是标题含「象棋」的那个）")
+            return
 
-        if best >= 0:
-            self.combo.setCurrentIndex(best)
-            w = wins[best]
-            if w["minimized"]:
-                self.statusBar().showMessage(
-                    f"已选中 {w['title']}，但它处于最小化状态 —— 请先还原窗口再点「开始」")
-            else:
-                self.statusBar().showMessage(
-                    f"已选中棋局窗口：{w['title']} · 点「开始」")
+        self.combo.setCurrentIndex(best)
+        w = wins[best]
+        if w["minimized"]:
+            self.statusBar().showMessage(
+                f"已选中 {w['title']}，但它处于最小化状态 —— 请先还原窗口再点「开始」")
         else:
             self.statusBar().showMessage(
-                "未自动找到棋局窗口，请在下拉框里手动选择 JJ象棋 窗口")
+                f"已选中棋局窗口：{w['title']} · 点「开始」")
 
     # ---------------- 启停 ----------------
     def toggle(self) -> None:

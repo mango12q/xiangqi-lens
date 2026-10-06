@@ -23,7 +23,7 @@ import numpy as np
 
 # 版本号：同时用于窗口标题、运行日志与打包产物命名，
 # 便于用户确认自己用的是哪一版。
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -101,6 +101,198 @@ def enable_dpi_awareness() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 目标窗口候选过滤
+# ---------------------------------------------------------------------------
+# 出现在「目标窗口」下拉框里的系统壳 / 输入法 / 悬浮层 / 本程序自身窗口，
+# 只会误导用户 —— 它们永远不可能是棋局窗口，却常常尺寸最大、排在最前。
+#
+# ★ 为什么必须过滤（真实故障）：``MS_WebcheckMonitor`` 是 explorer.exe 托管的
+#   微信小程序辅助窗口，实测尺寸 1701x1015，比真正的小程序窗口（天天象棋
+#   1307x778）还大。不过滤时它会排在下拉框第一位甚至被自动选中，而它的
+#   ``PrintWindow`` 返回全黑 → 抓帧回退到「屏幕区域截图」→ 截到的是被其他
+#   窗口遮挡 / 错位的画面。表现就是用户看到的"截屏歪了"，随后棋盘几何校验
+#   宽高比 0.74 失败、自动走棋坐标全错。
+_WINDOW_CLASS_DENY = {
+    # 桌面 / 任务栏 / 系统壳
+    "workerw", "progman", "shell_traywnd", "shell_secondarytraywnd",
+    "applicationframewindow", "windows.ui.core.corewindow",
+    "cef-osc-widget", "edgeuiinputtopwndclass", "ms_webcheckmonitor",
+    "base_powermessagewindow", "msctfime ui", "ime", "default ime",
+    "tooltips_class32", "sysshadow", "multitaskingviewframe",
+    # Win32 通用控件类（各程序用它承载的"内部小窗口"，不是应用主窗口）
+    "static", "button", "edit", "combobox", "listbox", "scrollbar",
+    "twincontrol", "richedit", "richedit20a", "richedit20w",
+    "toolbarwindow32", "systabcontrol32", "systreeview32",
+    "syslistview32", "msctls_statusbar32", "msctls_progress32",
+}
+# 类名**包含**这些子串也过滤：各程序自定义的辅助窗口类命名五花八门，
+# 靠精确枚举列不完，只能抓特征词。
+_WINDOW_CLASS_DENY_SUB = (
+    "trayicon", "notification", "auth window", "atl:",
+    "uuremoteclass", "callbackwindowthread", "xamlexplorerhostisland",
+)
+_WINDOW_PROC_DENY = {
+    "explorer.exe", "applicationframehost.exe", "textinputhost.exe",
+    "systemsettings.exe", "searchapp.exe", "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe", "nvidia overlay.exe", "nvidia share.exe",
+    "workbuddyai.exe",
+    # 游戏平台 / 显卡驱动 / 系统服务的辅助窗口进程（实测会刷出一堆
+    # TCLS_CORE_WND_* / NvSvc / UxdService 之类的假窗口）
+    "rail.exe", "tcls_core.exe", "wegame_env.exe", "df_helper_main.exe",
+    "nvcontainer.exe", "nvdisplay.container.exe", "nvsphelper64.exe",
+    "onedrive.sync.service.exe", "locationnotificationwindows.exe",
+}
+_WINDOW_TITLE_DENY = ("XiangQiLens", "WorkBuddy")
+
+
+def _window_pid(hwnd: int) -> int:
+    from ctypes import wintypes
+    pid = wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+    return int(pid.value)
+
+
+# ★ 为什么不用 psutil：它是**可选**依赖 —— 既没写进 README 的安装命令，也没
+#   进打包脚本的 hiddenimports。一旦缺失（打包发行版尤其容易），_proc_name
+#   会静默返回空串，于是 _WINDOW_PROC_DENY 与自动选择打分里的「微信进程 +40」
+#   全部失效而无人察觉。QueryFullProcessImageNameW 是系统 API，源码运行与
+#   打包后行为一致，且零三方依赖。
+_k32 = None
+if hasattr(ctypes, "windll"):
+    try:
+        _k32 = ctypes.windll.kernel32
+        _k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                     ctypes.c_uint32]
+        _k32.OpenProcess.restype = ctypes.c_void_p
+        _k32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32)]
+        _k32.QueryFullProcessImageNameW.restype = ctypes.c_int
+        _k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        _k32.CloseHandle.restype = ctypes.c_int
+    except Exception:
+        _k32 = None
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_PROC_NAME_CACHE: dict[int, str] = {}
+
+
+def _proc_name(pid: int) -> str:
+    """进程可执行文件名（纯 ctypes，零三方依赖）。拿不到时返回空串。
+
+    结果按 pid 缓存 —— 枚举窗口时同一个进程会被反复查询。
+    """
+    if pid <= 0:
+        return ""
+    if pid in _PROC_NAME_CACHE:
+        return _PROC_NAME_CACHE[pid]
+    name = ""
+    if _k32 is not None:
+        h = None
+        try:
+            h = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False,
+                                 int(pid))
+            if h:
+                size = ctypes.c_uint32(260)
+                buf = ctypes.create_unicode_buffer(size.value)
+                if _k32.QueryFullProcessImageNameW(h, 0, buf,
+                                                   ctypes.byref(size)):
+                    name = buf.value.rsplit("\\", 1)[-1]
+        except Exception:
+            name = ""
+        finally:
+            if h:
+                try:
+                    _k32.CloseHandle(h)
+                except Exception:
+                    pass
+    if len(_PROC_NAME_CACHE) > 512:      # 长跑进程里 pid 复用会让缓存无限增长
+        _PROC_NAME_CACHE.clear()
+    _PROC_NAME_CACHE[pid] = name
+    return name
+
+
+def is_candidate_window(hwnd: int, title: str, cls: str):
+    """判断窗口是否值得作为「目标窗口」候选。
+
+    返回 ``(是否候选, {"pid": int, "proc": str})``。被过滤的窗口不会出现在
+    下拉框里 —— 用户选不到，自动选择逻辑也不会误中。
+
+    过滤三类：
+      1. 本程序自身的窗口（标题里带「象棋识别分析」，不过滤会被自动选择
+         逻辑选中，然后抓自己的界面当棋盘）；
+      2. 系统壳 / 输入法 / 悬浮层（explorer、ApplicationFrameHost、
+         MS_WebcheckMonitor、NVIDIA Overlay 等）；
+      3. 标题明显是分析工具 / AI 助手的窗口（进程判据在打包后可能失效时的兜底）。
+    """
+    pid, proc = 0, ""
+    try:
+        pid = _window_pid(hwnd)
+        proc = _proc_name(pid)
+    except Exception:
+        pass
+    info = {"pid": pid, "proc": proc}
+
+    try:
+        import os
+        if pid and pid == os.getpid():
+            return False, info
+    except Exception:
+        pass
+    if (cls or "").strip().lower() in _WINDOW_CLASS_DENY:
+        return False, info
+    cl = (cls or "").strip().lower()
+    if any(sub in cl for sub in _WINDOW_CLASS_DENY_SUB):
+        return False, info
+    if proc and proc.strip().lower() in _WINDOW_PROC_DENY:
+        return False, info
+    t = title or ""
+    if any(k in t for k in _WINDOW_TITLE_DENY):
+        return False, info
+    return True, info
+
+
+def _point_belongs_to_window(hwnd: int, x: int, y: int) -> bool:
+    """屏幕点 (x, y) 是否落在 ``hwnd`` 或其子窗口上。
+
+    判断不了（异常）时返回 True，保持原有行为、不误拦。
+    """
+    try:
+        import win32gui
+        h = win32gui.WindowFromPoint((int(x), int(y)))
+        if not h:
+            return False
+        if int(h) == int(hwnd):
+            return True
+        return int(win32gui.GetAncestor(int(h), 2)) == int(hwnd)   # GA_ROOT
+    except Exception:
+        return True
+
+
+def _window_visible_ratio(hwnd: int, rect: tuple[int, int, int, int]) -> float:
+    """窗口矩形内采样点仍属于该窗口的比例（0~1）。
+
+    为什么不只看中心一个点：输入法候选框、tooltip、悬浮球这类小窗正好压在
+    窗口中心时，单点检查会误判"整窗被遮挡"而放弃抓帧。改成中心 + 四角内缩
+    共 5 点取比例，少数点被小浮层压住不影响整体判断。
+    """
+    l, t, r, b = rect
+    w, h = r - l, b - t
+    if w <= 0 or h <= 0:
+        return 0.0
+    inset = max(1, min(w, h) // 20)
+    pts = (
+        (l + w // 2, t + h // 2),
+        (l + inset, t + inset),
+        (r - inset, t + inset),
+        (l + inset, b - inset),
+        (r - inset, b - inset),
+    )
+    hit = sum(1 for x, y in pts if _point_belongs_to_window(hwnd, x, y))
+    return hit / len(pts)
+
+
+# ---------------------------------------------------------------------------
 # 抓帧
 # ---------------------------------------------------------------------------
 class ScreenSource:
@@ -121,7 +313,11 @@ class ScreenSource:
 
     @staticmethod
     def list_windows(min_size: int = 200):
-        """枚举可见且有标题的顶层窗口，按面积降序返回。"""
+        """枚举可见且有标题的顶层窗口，按面积降序返回。
+
+        已过滤系统壳 / 输入法 / 本程序自身的窗口（见 ``is_candidate_window``），
+        避免用户选到永远抓不出画面的窗口。
+        """
         import win32gui
 
         out = []
@@ -132,9 +328,12 @@ class ScreenSource:
             title = win32gui.GetWindowText(hwnd)
             if not title:
                 return True
+            cls = win32gui.GetClassName(hwnd)
+            if not is_candidate_window(hwnd, title, cls)[0]:
+                return True
             l, t, r, b = win32gui.GetWindowRect(hwnd)
             if (r - l) >= min_size and (b - t) >= min_size:
-                out.append((hwnd, title, win32gui.GetClassName(hwnd), (l, t, r, b)))
+                out.append((hwnd, title, cls, (l, t, r, b)))
             return True
 
         win32gui.EnumWindows(cb, None)
@@ -230,6 +429,14 @@ class ScreenSource:
         w, h = r - l, b - t
         if w <= 0 or h <= 0:
             return None
+        # ★ 遮挡保护：屏幕区域截图抓到的是"该矩形当前显示的东西"。若目标窗口
+        #   此刻不在最上层（被别的窗口盖住），抓到的就是别的程序的画面 ——
+        #   表现是棋盘错位 / 歪斜，随后几何校验失败、自动走棋坐标全错。
+        #   用 5 点采样，多数点不属于目标窗口才放弃本次抓帧（返回 None 让上层
+        #   明确报"无法抓取"，而不是静默产出垃圾图）。
+        if _window_visible_ratio(self.hwnd, (l, t, r, b)) < 0.6:
+            self.rect = None
+            return None
         try:
             import mss
             factory = getattr(mss, "MSS", None) or mss.mss
@@ -278,6 +485,9 @@ def list_windows_any(min_size: int = 200):
 
     与 ``ScreenSource.list_windows`` 的区别：后者只返回可见窗口，
     用户把对局窗口最小化后就找不到了。
+
+    同样过滤系统壳 / 输入法 / 本程序自身的窗口；返回的字典额外带
+    ``pid`` / ``proc``，供 UI 展示与「自动选中棋局窗口」打分使用。
     """
     import win32gui
 
@@ -288,6 +498,10 @@ def list_windows_any(min_size: int = 200):
         if not title:
             return True
         try:
+            cls = win32gui.GetClassName(hwnd)
+            ok, extra = is_candidate_window(hwnd, title, cls)
+            if not ok:
+                return True
             iconic = win32gui.IsIconic(hwnd)
             # 最小化时 GetWindowRect 不准，用 placement 的还原矩形
             if iconic:
@@ -299,9 +513,11 @@ def list_windows_any(min_size: int = 200):
                 out.append({
                     "hwnd": hwnd,
                     "title": title,
-                    "class": win32gui.GetClassName(hwnd),
+                    "class": cls,
                     "rect": (l, t, r, b),
                     "minimized": bool(iconic),
+                    "pid": extra.get("pid", 0),
+                    "proc": extra.get("proc", ""),
                 })
         except Exception:
             pass
