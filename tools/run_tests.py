@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -27,6 +28,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+
+# ★ 测试脚本都打印中文。CI（GitHub 的 Windows runner）上 stdout 默认是 cp1252，
+#   子进程会直接 UnicodeEncodeError 崩在 print 上 —— 本地中文控制台是 GBK
+#   能编中文，所以这个问题只在 CI 暴露。这里显式给子进程带上，别依赖调用方。
+CHILD_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 
 def discover(pattern: str = "test_*.py") -> list[Path]:
@@ -39,7 +45,7 @@ def run_one(path: Path, timeout: float, verbose: bool) -> tuple[str, str, float]
     try:
         p = subprocess.run([sys.executable, str(path)], cwd=str(ROOT),
                            capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout)
+                           errors="replace", timeout=timeout, env=CHILD_ENV)
     except subprocess.TimeoutExpired:
         return "TIMEOUT", f">{timeout:.0f}s", time.perf_counter() - t0
     dt = time.perf_counter() - t0

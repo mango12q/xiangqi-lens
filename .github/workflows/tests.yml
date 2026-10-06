@@ -20,6 +20,12 @@ jobs:
   test:
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      # ★ 必须：GitHub 的 Windows runner 上 stdout 默认是 cp1252，
+      #   而本项目所有测试脚本都打印中文 —— 不设这一项会直接
+      #   UnicodeEncodeError 崩在 print 上（本地中文 Windows 控制台是 GBK，
+      #   能编中文，所以这个问题只在 CI 上暴露）。
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
 
