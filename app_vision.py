@@ -19,6 +19,11 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 
+# 标准起始局面的**棋盘段**（不含轮次）。用来判断「盘面还是开局第一手」——
+# 象棋红先，所以此时行棋方必然是红方；自动走棋靠它挡掉「轮次被猜成黑方」的
+# 危险情形（见 Worker._pump_auto_move）。
+START_BOARD = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR"
+
 # 切到「应用根目录」：模型与引擎用相对路径查找，从桌面快捷方式或
 # 打包后的 exe 启动时，当前目录可能是任意位置，不切换会找不到资源。
 # app_backend.app_base() 会区分源码运行（脚本目录）与打包运行（exe 目录）。
@@ -37,22 +42,280 @@ from app_backend import (HERE as BACKEND_DIR, MultiPVBuffer, ScreenSource,
                          check_board_geometry, check_position, clear_hash,
                          create_engine, create_vision, enable_dpi_awareness,
                          fen_with_side, format_score, format_winrate,
-                         list_windows_any, move_arrow, move_screen_points,
-                         move_to_chinese, parse_engine_options, pv_to_chinese,
-                         selftest, short_winrate, validate_fen, wdl_to_red,
-                         window_state)
+                         has_no_legal_moves, is_strict_legal_move,
+                         list_windows_any, move_arrow,
+                         move_screen_points, move_to_chinese,
+                         parse_engine_options, pv_to_chinese, selftest,
+                         short_winrate, validate_fen, wdl_to_red, window_state)
 
+from app_book import OpeningBook
 from app_input import MouseClicker, ensure_foreground, is_point_on_window
 
 from PySide6.QtCore import QObject, QRect, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
-                               QDoubleSpinBox, QFormLayout, QGridLayout,
-                               QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                               QLineEdit, QMainWindow, QMessageBox, QPushButton,
-                               QScrollArea, QSpinBox, QSplitter, QStatusBar,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtGui import (QColor, QFont, QImage, QPainter, QPen, QPixmap)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
+                               QDialog, QDoubleSpinBox, QFileDialog,
+                               QFormLayout, QGridLayout, QGroupBox,
+                               QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                               QMainWindow, QMessageBox, QPushButton,
+                               QRadioButton, QScrollArea, QSpinBox, QSplitter,
+                               QStatusBar, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
+
+
+# ---------------------------------------------------------------------------
+# 纯函数：识别稳定（动画抑制）与终局判定
+# ---------------------------------------------------------------------------
+# 抽成模块级纯函数是为了能脱离 Qt/Worker 单独做单元测试（见
+# tools/test_settle_gate.py 与 tools/test_gameover.py）。
+def gray_small(img, size: tuple[int, int] = (144, 160)):
+    """转灰度并缩放，供帧间差异比较用。"""
+    g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    return cv2.resize(g, size, interpolation=cv2.INTER_AREA)
+
+
+def motion_ratio(prev, cur, pixel_delta: int = 25) -> float:
+    """两帧灰度图的「变化像素占比」（0.0 ~ 1.0）。
+
+    用占比而不是平均绝对差，是为了对**局部**动画敏感 —— 天天象棋的「吃」
+    字只覆盖盘面中间一小块，平均差会被大片静止区域稀释掉，占比不会。
+    首帧（prev 为 None）或形状不一致时返回 0.0（按静止处理，避免开局卡住）。
+    """
+    if prev is None or cur is None or prev.shape != cur.shape:
+        return 0.0
+    diff = cv2.absdiff(prev, cur)
+    return float((diff > pixel_delta).mean())
+
+
+def settle_ready(still_since: float, now: float, settle_ms: int) -> bool:
+    """画面是否已持续静止达到 ``settle_ms``。"""
+    if still_since <= 0.0:
+        return False
+    return (now - still_since) * 1000.0 >= max(0, settle_ms)
+
+
+def suppress_timed_out(settle_start: float, now: float, max_ms: int) -> bool:
+    """「画面一直在动」是否已超过最长抑制时长（该强制放行一帧了）。
+
+    没有这个兜底，盘面上若有**持续**动画/闪烁（将军提示、倒计时环、平台特效），
+    变化率会一直超阈值 → 永远 continue → **永不识别**。
+    """
+    if settle_start <= 0.0:
+        return False
+    return (now - settle_start) * 1000.0 >= max(0, max_ms)
+
+
+def game_over_decision(no_legal_move: bool, stalled: bool,
+                       stall_fallback: bool = False) -> str:
+    """终局判定。返回结束原因，``''`` 表示未结束。
+
+    * **无真合法着法**（将死/困毙）—— 唯一可靠的信号，单独即可判定。
+      用 ``app_backend.has_no_legal_moves``（cchess ``no_moves()``，内部逐着做
+      自将检查），不能用 ``enumerate_legal_moves`` —— 后者基于
+      ``is_valid_iccs_move``，是伪合法，被将军时仍会报出一堆"能走"的着法。
+    * **长时间停滞** —— 兜底，默认关闭（``stall_fallback``）。用于对手认输 /
+      超时 / 平台弹结算框但盘面仍可走的情况。风险是对手长考会被误判成终局，
+      所以必须由用户显式开启并配合 ``restart_wait`` 调参。
+
+    ★ 为什么**不**用「引擎报绝杀分」判定：绝杀分只说明**某一方能够取胜**，
+    不代表棋局已经结束 —— 我方即将杀棋时引擎同样报绝杀，拿它单独判定会把
+    正常对局误判成终局。它只适合当日志线索。
+    """
+    if no_legal_move:
+        return "无合法着法（将死/困毙）"
+    if stall_fallback and stalled:
+        return "局面长时间停滞（停滞兜底）"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# 模板框选（自动接盘的按钮标定）
+# ---------------------------------------------------------------------------
+class _RegionLabel(QLabel):
+    """显示一张截图并支持鼠标拖拽框选。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._p0 = None
+        self._p1 = None
+        self.selection: tuple | None = None      # (x, y, w, h)，显示坐标
+
+    def mousePressEvent(self, ev) -> None:
+        if ev.button() == Qt.LeftButton:
+            self._p0 = ev.position().toPoint()
+            self._p1 = self._p0
+            self.selection = None
+            self.update()
+
+    def mouseMoveEvent(self, ev) -> None:
+        if self._p0 is not None:
+            self._p1 = ev.position().toPoint()
+            self.update()
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if ev.button() != Qt.LeftButton or self._p0 is None:
+            return
+        self._p1 = ev.position().toPoint()
+        x0, y0 = min(self._p0.x(), self._p1.x()), min(self._p0.y(), self._p1.y())
+        x1, y1 = max(self._p0.x(), self._p1.x()), max(self._p0.y(), self._p1.y())
+        # 太小的框多半是误点，不认
+        self.selection = ((x0, y0, x1 - x0, y1 - y0)
+                          if (x1 - x0) >= 8 and (y1 - y0) >= 8 else None)
+        self._p0 = None
+        self.update()
+
+    def paintEvent(self, ev) -> None:
+        super().paintEvent(ev)
+        p = QPainter(self)
+        if self._p0 is not None and self._p1 is not None:
+            p.setPen(QPen(QColor("#e74c3c"), 2))
+            p.drawRect(QRect(self._p0, self._p1).normalized())
+        elif self.selection:
+            p.setPen(QPen(QColor("#2ecc71"), 2))
+            p.drawRect(*self.selection)
+
+
+class RegionSelectDialog(QDialog):
+    """在窗口截图上框选一块区域，用于录制按钮模板。
+
+    **为什么框选而不是直接点目标窗口**：① 模板匹配比固定坐标鲁棒得多 ——
+    平台改版、分辨率变化、弹窗把按钮挤走，固定坐标就失效；② 在本程序的
+    截图上拖拽，**完全不会误触目标窗口**（不会手一抖把「再来一局」点掉）。
+    """
+
+    def __init__(self, image_bgr, parent=None, title: str = "框选区域",
+                 hint: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        h, w = image_bgr.shape[:2]
+        self._scale = min(1.0, 1180.0 / max(1, w), 740.0 / max(1, h))
+        if self._scale < 1.0:
+            disp = cv2.resize(image_bgr,
+                              (max(1, int(w * self._scale)),
+                               max(1, int(h * self._scale))),
+                              interpolation=cv2.INTER_AREA)
+        else:
+            disp = image_bgr
+        rgb = np.ascontiguousarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
+        qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0],
+                      QImage.Format_RGB888).copy()
+
+        self.view = _RegionLabel(self)
+        self.view.setPixmap(QPixmap.fromImage(qimg))
+        self.view.setFixedSize(qimg.size())
+
+        lay = QVBoxLayout(self)
+        if hint:
+            lbl = QLabel(hint)
+            lbl.setWordWrap(True)
+            lay.addWidget(lbl)
+        lay.addWidget(self.view)
+        row = QHBoxLayout()
+        btn_ok = QPushButton("确定")
+        btn_cancel = QPushButton("取消")
+        btn_ok.clicked.connect(self._on_ok)
+        btn_cancel.clicked.connect(self.reject)
+        row.addStretch(1)
+        row.addWidget(btn_ok)
+        row.addWidget(btn_cancel)
+        lay.addLayout(row)
+
+    def _on_ok(self) -> None:
+        if not self.view.selection:
+            QMessageBox.information(self, "提示", "请先在图上按住左键拖拽，框住目标按钮")
+            return
+        self.accept()
+
+    def selected_rect(self) -> tuple | None:
+        """返回**原图坐标**下的 ``(x, y, w, h)``；未框选返回 None。"""
+        if not self.view.selection:
+            return None
+        x, y, w, h = self.view.selection
+        s = self._scale
+        return (int(round(x / s)), int(round(y / s)),
+                max(1, int(round(w / s))), max(1, int(round(h / s))))
+
+
+# ---------------------------------------------------------------------------
+# 异常可见化
+# ---------------------------------------------------------------------------
+_last_report_t = 0.0
+
+
+def report_exception(exc: BaseException, where: str = "") -> None:
+    """把未捕获异常写进日志并弹窗提示。
+
+    **为什么必须有**：程序用 ``pythonw`` 启动**没有控制台**，Qt 槽函数里抛出
+    的异常会被 PySide 打到 stderr 后吞掉 —— 用户看到的就是「点了按钮没反应」，
+    完全无从排查。（本次「框选没反应」就是因为 ``int((hwnd, title))`` 抛了
+    TypeError 被静默吞掉，一直没人发现。）
+
+    ★ 弹窗用**非阻塞 + 限频**：槽函数可能被高频调用（例如每帧一次），
+    ``QMessageBox.critical`` 是模态的，会卡死 GUI 线程；反复弹也会堆一屏。
+    """
+    global _last_report_t
+    import traceback
+    try:
+        txt = "".join(traceback.format_exception(
+            type(exc), exc, exc.__traceback__))
+    except Exception:
+        txt = f"{type(exc).__name__}: {exc}"
+    head = f"{type(exc).__name__}: {exc}"
+    if where:
+        head = f"[{where}] {head}"
+    try:
+        with open(app_base() / "XiangQiLens_crash.log", "a",
+                  encoding="utf-8") as fh:
+            fh.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n{txt}")
+    except Exception:
+        pass
+
+    now = time.time()
+    if now - _last_report_t < 3.0:              # 限频，避免刷屏/卡死
+        return
+    _last_report_t = now
+    try:
+        box = QMessageBox(QMessageBox.Critical, "程序内部错误",
+                          f"{head}\n\n详细信息已写入 XiangQiLens_crash.log")
+        box.setAttribute(Qt.WA_DeleteOnClose, True)
+        box.show()                              # 非阻塞：不卡 GUI 线程
+    except Exception:
+        pass
+
+
+def safe_slot(fn):
+    """装饰 Qt 槽函数：异常不再被静默吞掉，而是写日志 + 弹窗。
+
+    ★ **必须按被包函数的签名裁剪多余的实参**：Qt 信号可能带参数
+    （``Signal(bool)`` / ``Signal(dict)``…），而槽函数可能一个都不收；
+    PySide 会把信号实参**全量**传给槽，包装器里的 ``fn(*a)`` 就会抛
+    ``TypeError: takes 1 positional argument but 2 were given``。
+    ``functools.wraps`` 只影响 ``inspect.signature`` 的观感，**不会**让
+    PySide 少传参数（已实测），所以这里必须自己裁。
+    """
+    import functools
+    import inspect
+
+    try:
+        _sig = inspect.signature(fn)
+        _params = list(_sig.parameters.values())
+        _n_pos = sum(1 for p in _params
+                     if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
+        _varargs = any(p.kind == p.VAR_POSITIONAL for p in _params)
+    except Exception:
+        _n_pos, _varargs = 0, True
+
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        if not _varargs and len(args) > _n_pos:
+            args = args[:_n_pos]
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:                     # noqa: BLE001
+            report_exception(exc, where=fn.__name__)
+            return None
+    return _wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +336,14 @@ class Worker(QObject):
     auto_state_changed = Signal(bool)
     # 自动走棋每次动作的预览/执行信息 {best, chinese, from, to, dry}
     auto_preview = Signal(dict)
+    # 开局库状态变化 {enabled, path, kind, ok, note}
+    book_state = Signal(dict)
+    # 识别稳定（动画抑制）状态变化 {suppress, settling, ratio}
+    settle_state = Signal(dict)
+    # 终局/接盘状态 {over, restarted, note}
+    game_state = Signal(dict)
+    # 「新局」自动判断出的我方执子 {side, why}
+    side_detected = Signal(dict)
 
     def __init__(self, source: ScreenSource) -> None:
         super().__init__()
@@ -140,6 +411,47 @@ class Worker(QObject):
         self._auto_moves_made = 0
         self._cur_rows: list[str] | None = None   # 当前已采信矩阵（校验起点棋子）
         self._auto_preview: dict = {}   # 最近一次预览/落子信息（给 UI）
+        # ---- 开局库（应用层实现，见 app_book.py）----
+        self.book_enabled = False
+        self.book_path = ""
+        self.book_mode = "hint"         # "hint" 仅提示 | "play" 库着优先
+        self.book_max_ply = 40          # 只在前 N 手内用库（0 = 不限）
+        self._book: OpeningBook | None = None
+        self._book_note = ""            # 库加载结果描述（给 UI）
+        self._book_move: dict | None = None   # 当前局面的库着 {move,weight,chinese}
+        # ---- 识别稳定（动画抑制）----
+        # 天天象棋吃子时棋盘中间会弹「吃」字动画，遮住盘面导致误识别。
+        # 用帧间像素差异检测「画面正在变化」，变化期间一律不进入演化校验，
+        # 直到画面静止达到 settle_ms 才恢复 —— 即「等动画消失后再识别」。
+        self.anim_suppress = True       # 动画抑制总开关（默认开）
+        self.settle_ms = 400            # 画面需静止这么久才恢复识别
+        self.motion_thresh = 0.02       # 变化像素比例阈值（2%）
+        # 最长抑制时长：超过就强制放行一帧，防止持续动画把识别永久卡死
+        self.anim_max_ms = 5000
+        self._prev_gray = None          # 上一帧的拉正灰度小图
+        self._still_since = 0.0         # 画面开始静止的时刻
+        self._settle_start = 0.0        # 本轮「画面在动」的起始时刻（超时兜底用）
+        self._settling = False          # 是否正处于「等待稳定」状态
+        # ---- 自动接盘 ----
+        self.auto_restart = False       # 总开关（默认关）
+        self.restart_wait = 20.0        # 终局后等待多久判定「确实结束了」
+        self.restart_stall_fallback = False   # 停滞兜底（默认关，可能误判）
+        # 按钮**模板**（PNG 路径）。用模板匹配而不是固定坐标：平台改版、分辨率
+        # 变化、弹窗把按钮挤走时，固定坐标会失效，模板还能找到。
+        self.restart_tpl = ""           # 「再来一局」模板
+        self.restart_close_tpl = ""     # 「关闭弹窗」模板（X / 确定）
+        self.restart_match = 0.80       # 模板匹配阈值（0~1，越大越严）
+        self.restart_tries = 8          # 接盘最多尝试几次（含关弹窗）
+        self._tpl_restart = None        # 载入后的模板（numpy BGR）
+        self._tpl_close = None
+        self._game_over = False
+        self._no_change_since = 0.0     # 局面最后一次变化的时刻
+        self._last_over_check = 0.0     # 终局判定节流时间戳
+        self._restart_pending_t = 0.0   # 已点击「再来一局」的时刻（待校验）
+        self.restart_verify_s = 12.0    # 点击后多久没新对局就提示失败
+        # ---- 「新局」自动判断我方执子 ----
+        self.auto_side_pending = False  # 待自动判断（棋盘一出现就判）
+        self._side_note = ""            # 上次的失败原因（避免刷屏）
         # 主线程 → Worker 的参数变更命令队列。
         # 不能用 Qt 信号：run() 是个长驻阻塞循环，永远不会把控制权交回该线程
         # 的事件循环，queued 连接的槽函数根本不会被派发。
@@ -204,6 +516,67 @@ class Worker(QObject):
             board.append(s)
         return "/".join(board) + f" {side_to_move} - - 0 1"
 
+    # ---- 识别稳定（动画抑制）----
+    def _frame_moving(self, warped) -> tuple[bool, float]:
+        """比较相邻两帧的拉正棋盘，判断「画面是否正在变化」。
+
+        返回 ``(是否在动, 变化像素比例)``。
+
+        实现：转灰度 → 缩到 144x160（够用且快）→ 与上一帧做绝对差 →
+        统计差值 > 25 的像素占比。天天象棋的「吃」字动画是画在盘面中间
+        的，会落在拉正图里，因此能被这一步抓到。
+
+        注意首帧没有参照物，一律按「静止」返回，避免开局就一直卡住。
+        """
+        try:
+            g = gray_small(warped)
+        except Exception:
+            return False, 0.0
+        prev, self._prev_gray = self._prev_gray, g
+        ratio = motion_ratio(prev, g)
+        return ratio > self.motion_thresh, ratio
+
+    # ---- 「新局」自动判断我方执子 ----
+    @staticmethod
+    def _detect_my_side(keypoints, img_shape=None) -> tuple[str | None, str]:
+        """从棋盘朝向判断我方执子，返回 ``(side, 说明)``；判不了返回 ``(None, 原因)``。
+
+        原理：识别模型给的 4 个角是**内容语义**的 —— ``BONE_NAMES = [A0, A8,
+        J0, J8]``，前两个是黑方两角、后两个是红方两角（见 xq_vision.py）。
+        而象棋客户端一律把**己方**摆在画面下方 ⇒ 谁的两角在下面（y 更大），
+        谁就是我方。跟「红方先手」无关，只看朝向，所以开局红方还没动子也能判。
+
+        质量门（很重要）：关键点检测偶尔会退化（例如 A0 跑到画面底部、A8 在
+        顶部，或整组点跑到画面外）。这里要求「同一条边的两角大致等高」+
+        「棋盘有足够高度」+「四点都在画面内」，否则拒绝判断而不是瞎猜。
+        """
+        try:
+            kp = np.asarray(keypoints, dtype=float)
+        except Exception:
+            return None, "关键点无法解析"
+        if kp.shape[0] < 4 or not np.all(np.isfinite(kp[:4])):
+            return None, "关键点数量不足"
+
+        a0, a8, j0, j8 = kp[0], kp[1], kp[2], kp[3]
+        a_y = (a0[1] + a8[1]) / 2.0
+        j_y = (j0[1] + j8[1]) / 2.0
+        span = abs(a_y - j_y)
+        if span < 40:
+            return None, "棋盘高度太小"
+        # 同一条边的两个角应当大致等高（横边），否则说明关键点跑偏了
+        if abs(a0[1] - a8[1]) > 0.35 * span or abs(j0[1] - j8[1]) > 0.35 * span:
+            return None, "关键点不成四边形"
+        if img_shape is not None:
+            h, w = img_shape[:2]
+            pts = kp[:4]
+            if (pts[:, 0].min() < -0.05 * w or pts[:, 0].max() > 1.05 * w
+                    or pts[:, 1].min() < -0.05 * h or pts[:, 1].max() > 1.05 * h):
+                return None, "关键点落在画面外"
+
+        if a_y > j_y:
+            return "b", f"黑方底线在画面下方（y {a_y:.0f} > {j_y:.0f}）"
+        return "w", f"红方底线在画面下方（y {j_y:.0f} > {a_y:.0f}）"
+
     @Slot()
     def run(self) -> None:
         self._run = True
@@ -265,6 +638,9 @@ class Worker(QObject):
             # 自动走棋：拿到确定 bestmove 且轮到我方时点击落子。
             # 放在 _pump_engine 之后、其余 continue 分支之前，保证每轮都评估一次。
             self._pump_auto_move()
+            # 终局判定 / 自动接盘：同样每轮评估（内部按 1s 节流）。
+            # 放在 continue 分支之前，否则局面一旦不再变化就永远走不到。
+            self._check_game_over()
 
             # 先查窗口状态：最小化时截图拿不到棋盘，必须明确告知用户，
             # 否则只会表现为"局面不合法"，让人摸不着头脑。
@@ -318,6 +694,74 @@ class Worker(QObject):
                 self._log(f"几何校验失败: {geo_why}")
                 time.sleep(0.5)
                 continue
+
+            # ---- 动画/不稳定期抑制（天天象棋「吃」字动画等）----
+            # 拉正图是固定尺寸的，帧间像素差异能直接反映「盘面正在变化」。
+            # 变化期间一律不进入演化校验，直到画面静止达到 settle_ms 才恢复，
+            # 这就是需求里的「等动画消失后再识别盘面变化，有变化了再移动棋子」。
+            #
+            # ★ 必须有「最长抑制时长」兜底：若盘面区域存在**持续**动画/闪烁
+            #   （将军提示、倒计时环、平台自己的特效），ratio 会一直超阈值，
+            #   没有兜底就永远 continue、**永不识别**。超时后强制放行一帧，
+            #   放行进来的错帧由 BoardTracker 的演化校验挡下，代价可控。
+            if self.anim_suppress:
+                moving, ratio = self._frame_moving(res["warped"])
+                now_m = time.perf_counter()
+                if moving:
+                    self._still_since = 0.0
+                    if self._settle_start == 0.0:
+                        self._settle_start = now_m
+                    if not self._settling:
+                        self._settling = True
+                        self._log(f"动画抑制：画面变化 {ratio * 100:.1f}%，暂停识别")
+                        try:
+                            self.settle_state.emit(
+                                {"suppress": True, "settling": True, "ratio": ratio})
+                        except Exception:
+                            pass
+                    if not suppress_timed_out(self._settle_start, now_m,
+                                              self.anim_max_ms):
+                        self.status.emit(
+                            f"画面变化中（{ratio * 100:.1f}%），等待稳定后再识别…")
+                        time.sleep(0.05)
+                        continue
+                    # 超时兜底：强制放行一帧，并把抑制计时重新起算
+                    self._settle_start = now_m
+                    self._log(f"动画抑制超时（>{self.anim_max_ms:.0f}ms），强制放行一帧")
+                else:
+                    self._settle_start = 0.0
+                    if self._still_since == 0.0:
+                        self._still_since = now_m
+                    if not settle_ready(self._still_since, now_m, self.settle_ms):
+                        time.sleep(0.05)      # 已静止但还没到静置时长
+                        continue
+                    if self._settling:
+                        self._settling = False
+                        self._log("画面已稳定，恢复识别")
+                        try:
+                            self.settle_state.emit(
+                                {"suppress": True, "settling": False, "ratio": ratio})
+                        except Exception:
+                            pass
+
+            # ---- 「新局」自动判断我方执子 ----
+            # 放在动画抑制之后：拿到的是一帧**稳定**画面，关键点更可信。
+            # 开局红方还没动子 / 对局还在匹配中时也能判（只看棋盘朝向）。
+            if self.auto_side_pending:
+                _side, _why = self._detect_my_side(res["keypoints"], bgr.shape)
+                if _side:
+                    self.auto_side_pending = False
+                    self._side_note = ""
+                    self.my_side = _side
+                    self._log(f"自动判断我方执子：{_side}（{_why}）")
+                    try:
+                        self.side_detected.emit({"side": _side, "why": _why})
+                    except Exception:
+                        pass
+                elif _why != self._side_note:
+                    self._side_note = _why
+                    self.status.emit(
+                        f"自动判断我方执子：暂时判不了（{_why}），棋盘出现后会自动重试…")
 
             # 连续 N 帧一致才进入演化校验（先滤掉动画/过渡帧）
             if key == self._last_key:
@@ -383,6 +827,13 @@ class Worker(QObject):
                 # 与矩阵/FEN 无关（矩阵永远保持标准朝向）
                 "flipped": self.my_side == "b",
             }
+            # 局面确实变了（走子/接手）→ 刷新「最后变化时刻」，并重置终局判定
+            if reason in ("走子", "稳定新局面", "强制采信"):
+                self._no_change_since = time.perf_counter()
+                self._last_move_side = side
+                self._game_over = False
+            # 开局库：按当前局面查库，命中就把库着挂到 diag 上（并供自动走棋取用）
+            self._refresh_book_move(fen)
             self.status.emit(move_note or "引擎分析中…")
             try:
                 # 非阻塞发起搜索：立即返回，结果由 _pump_engine 流式补齐
@@ -396,6 +847,11 @@ class Worker(QObject):
                 self._log(f"引擎异常: {exc}")
                 self._rebuild_engine()
 
+            # ---- 终局判定 / 自动接盘 ----
+            # 必须在这里（每轮）调用，不能挂在「局面被采纳」分支上 ——
+            # 终局的特征就是局面不再变化，挂在那上面永远不会触发。
+            self._check_game_over()
+
             diag = self._build_diag()
             warped = cv2.cvtColor(res["warped"], cv2.COLOR_RGB2BGR)
             if self.my_side == "b":
@@ -408,6 +864,11 @@ class Worker(QObject):
                              f"分数 {diag['score']} · 识别 {t_recog:.0f}ms · "
                              f"{self._tracker.stats}")
 
+        # 在 Worker 线程里关掉开局库连接：sqlite3 连接有线程亲和性，
+        # 若留给主线程的 shutdown() 去关，会抛
+        # "SQLite objects created in a thread can only be used in that same thread"
+        # （被 except 吞掉，表现为连接泄漏）。
+        self._close_book()
         self.done.emit()
 
     def stop(self) -> None:
@@ -425,6 +886,7 @@ class Worker(QObject):
                 pass
             self._dispose_engine(self._engine)
             self._engine = None
+        self._close_book()
         if self._log_fh is not None:
             try:
                 self._log("已停止")
@@ -670,6 +1132,12 @@ class Worker(QObject):
         wdl = top["wdl"] if top else None
         cp = top["score_cp"] if top else None
 
+        # 开局库：命中且为「库着优先」时，用库着覆盖建议与箭头
+        book = self._book_move
+        book_used = bool(book and self.book_playable())
+        if book_used:
+            best = book["move"]
+
         # alts：BoardView 需要每条线首着的箭头坐标
         alts: list[dict] = []
         for ln in lines:
@@ -709,6 +1177,14 @@ class Worker(QObject):
             "time_ms": top["time_ms"] if top else None,
             "engine_mode": "持续加深" if self.infinite else "限时",
             "guard": self._tracker.stats if self._tracker is not None else "",
+            # 开局库
+            "book": book,
+            "book_used": book_used,
+            "book_mode": self.book_mode,
+            "book_enabled": bool(self.book_enabled and self._book is not None),
+            # 终局 / 接盘
+            "game_over": self._game_over,
+            "settling": self._settling,
         }
 
     # ---- 自动走棋（模拟鼠标点击落子）----
@@ -738,6 +1214,21 @@ class Worker(QObject):
             self.auto_state_changed.emit(False)
         except Exception:
             pass
+
+    def _turn_guard_blocks(self) -> bool:
+        """轮次**未经验证**时是否该拦住自动走棋。
+
+        若 tracker 认为是**黑方**走、又还没观察到任何走子、且盘面还是**初始
+        局面** —— 这个轮次几乎必然是猜错的（象棋红先，新局第一手一定是红方）。
+        此时落子会走出不该走的着法，所以直接不点。
+
+        为什么只挡「初始局面」：真·黑方先走的局面不存在；而中盘接手时盘面
+        本来就不是初始局面，不会误伤（那种情况轮次确实可能是我方）。
+        """
+        return (self._tracker is not None
+                and not self._tracker.moves
+                and self._cur_side == "b"
+                and self._cur_fen_base == START_BOARD)
 
     def _pump_auto_move(self) -> None:
         """每轮循环调用：轮到我方且拿到确定 bestmove 时，模拟鼠标点击落子。
@@ -771,18 +1262,41 @@ class Worker(QObject):
             return
 
         # ---- 2) 触发闸门 ----
+        # 画面正在变化（动画/落子中）→ 一律不点，等识别稳定了再说。
+        # 这正是需求里的「有变化了再移动棋子」：只在稳定盘面上动作。
+        if self.anim_suppress and self._settling:
+            return
         best = self._last_bestmove
         fen = self._last_bestmove_fen
-        if not best or best in ("(none)", "0000"):
-            return
-        if self._searching:
-            return                                  # 搜索未结束，bestmove 未定
-        if not fen or not self._cur_fen_base:
-            return
-        if fen != fen_with_side(self._cur_fen_base, self._cur_side):
-            return                                  # bestmove 属于旧局面
+        fen_cur = (fen_with_side(self._cur_fen_base, self._cur_side)
+                   if self._cur_fen_base else "")
+        # 开局库优先：库着不依赖引擎搜索结果，局面一稳定就能走，无需等搜索。
+        book_best = ""
+        if (self.book_playable() and self._book_move and fen_cur
+                and self._cur_side == self.my_side):
+            cand = str(self._book_move.get("move") or "")
+            # ★ 复核一遍：库着是按「查库那一刻」的 fen 过滤的，之后轮次可能被
+            #   引擎校正（_cur_side 翻转）→ 同一个库着在新轮次下可能非法。
+            if cand and is_strict_legal_move(fen_cur, cand):
+                book_best = cand
+            elif cand:
+                self._log(f"开局库着法在最新局面下已非法，丢弃: {cand}")
+        if book_best:
+            best, fen = book_best, fen_cur
+        else:
+            if not best or best in ("(none)", "0000"):
+                return
+            if self._searching:
+                return                              # 搜索未结束，bestmove 未定
+            if not fen or not fen_cur:
+                return
+            if fen != fen_cur:
+                return                              # bestmove 属于旧局面
         if self._cur_side != self.my_side:
             return                                  # ★ 只走我方
+        if self._turn_guard_blocks():
+            self._log("轮次闸门：盘面还是开局却认为轮到黑方，暂不落子")
+            return
         if (fen, best) == self._auto_done:
             return                                  # 同局面同着法只点一次
         if now - self._auto_last_click_t < self.auto_cooldown:
@@ -793,6 +1307,8 @@ class Worker(QObject):
             return
         if not self._from_is_my_piece(best):
             return
+        if book_best:
+            self._log(f"开局库命中，走库着 {best}")
         if self.source.hwnd:
             ok, minimized, _ = window_state(self.source.hwnd)
             if not ok or minimized:
@@ -919,6 +1435,339 @@ class Worker(QObject):
         except Exception:
             pass
 
+    # ---- 开局库 ----
+    def book_playable(self) -> bool:
+        """开局库是否参与「库着优先」（自动走棋取库着）。"""
+        return (self.book_enabled and self._book is not None
+                and self.book_mode == "play")
+
+    def _book_legal(self, fen: str, mv: str) -> bool:
+        """按**当前轮次**校验库着是否合法。
+
+        xqb 的 key 只含棋盘布局、不含轮次，同一个布局在红/黑轮次下会命中
+        同一批着法。不过滤就可能拿对方的着法去点鼠标，所以必须校验。
+
+        用**严格**校验（含自将/照面），不是 ``is_legal_move`` 那种伪合法 ——
+        库里的着法若会让自己的将暴露，点出去就是一歩非法棋。
+        """
+        return is_strict_legal_move(fen, mv)
+
+    def _refresh_book_move(self, fen: str) -> None:
+        """按当前局面查一次库，结果存到 ``self._book_move``。"""
+        self._book_move = None
+        if not self.book_enabled or self._book is None or not fen:
+            return
+        if self.book_max_ply and self._tracker is not None \
+                and len(self._tracker.moves) >= self.book_max_ply:
+            return                                  # 已超出开局库深度
+        try:
+            hit = self._book.pick(fen, "best", legal_check=self._book_legal)
+        except Exception as exc:
+            self._log(f"开局库查询失败: {exc}")
+            return
+        if not hit:
+            return
+        self._book_move = {
+            "move": hit["move"],
+            "weight": int(hit.get("weight", 1)),
+            "chinese": move_to_chinese(fen, hit["move"]),
+            "ply": len(self._tracker.moves) if self._tracker else 0,
+        }
+
+    def apply_book_params(self, p: dict) -> None:
+        """应用开局库参数（Worker 线程内调用）。
+
+        ★ 必须在 Worker 线程里打开库：sqlite3 连接有线程亲和性，
+        在主线程建好再拿到这里用会抛 "SQLite objects created in a thread
+        can only be used in that same thread"。
+        """
+        self.book_enabled = bool(p.get("enabled", self.book_enabled))
+        self.book_mode = str(p.get("mode", self.book_mode))
+        if self.book_mode not in ("hint", "play"):
+            self.book_mode = "hint"
+        try:
+            self.book_max_ply = max(0, int(p.get("max_ply", self.book_max_ply)))
+        except Exception:
+            pass
+
+        new_path = str(p.get("path", self.book_path) or "")
+        if new_path != self.book_path or (self._book is None and new_path):
+            self.book_path = new_path
+            self._close_book()
+            self._book_note = ""
+            if new_path:
+                try:
+                    self._book = OpeningBook(new_path)
+                    self._book_note = self._book.describe()
+                    self._log(f"开局库已加载: {self._book_note}")
+                except Exception as exc:
+                    self._book = None
+                    self._book_note = f"加载失败: {exc}"
+                    self._log(f"开局库加载失败: {exc}")
+
+        # 开关或库变化后立刻按当前局面重查一次，UI 能马上看到效果
+        if self._cur_fen_base:
+            self._refresh_book_move(
+                fen_with_side(self._cur_fen_base, self._cur_side))
+        try:
+            self.book_state.emit({
+                "enabled": self.book_enabled, "path": self.book_path,
+                "kind": self._book.kind if self._book else "",
+                "ok": self._book is not None, "note": self._book_note,
+                "mode": self.book_mode, "max_ply": self.book_max_ply,
+                "hit": self._book_move,
+            })
+        except Exception:
+            pass
+
+    def _close_book(self) -> None:
+        if self._book is not None:
+            try:
+                self._book.close()
+            except Exception:
+                pass
+        self._book = None
+        self._book_move = None
+
+    # ---- 自动接盘 ----
+    def apply_restart_params(self, p: dict) -> None:
+        """应用自动接盘参数（Worker 线程内调用）。"""
+        self.auto_restart = bool(p.get("enabled", self.auto_restart))
+        try:
+            self.restart_wait = max(3.0, float(p.get("wait", self.restart_wait)))
+        except Exception:
+            pass
+        self.restart_stall_fallback = bool(
+            p.get("stall_fallback", self.restart_stall_fallback))
+        try:
+            self.restart_match = min(0.99, max(0.30, float(
+                p.get("match", self.restart_match))))
+        except Exception:
+            pass
+
+        new_r = str(p.get("tpl", self.restart_tpl) or "")
+        new_c = str(p.get("close_tpl", self.restart_close_tpl) or "")
+        changed = (new_r != self.restart_tpl) or (new_c != self.restart_close_tpl)
+        self.restart_tpl, self.restart_close_tpl = new_r, new_c
+        if changed:
+            self._load_templates()
+            try:
+                self.game_state.emit({
+                    "over": False, "restarted": False, "note": "",
+                    "tpl": bool(self._tpl_restart),
+                    "close_tpl": bool(self._tpl_close),
+                })
+            except Exception:
+                pass
+
+        if not self.auto_restart:
+            self._game_over = False
+
+    @staticmethod
+    def _read_tpl(path: str):
+        """读模板 PNG。
+
+        ★ 不能用 ``cv2.imread`` —— 它在 Windows 上**不支持非 ASCII 路径**
+        （应用目录可能含中文），会静默返回 None。改用 imdecode。
+        """
+        if not path:
+            return None
+        try:
+            buf = np.fromfile(str(path), dtype=np.uint8)
+            if buf.size == 0:
+                return None
+            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            return img if img is not None and img.size else None
+        except Exception:
+            return None
+
+    def _load_templates(self) -> None:
+        self._tpl_restart = self._read_tpl(self.restart_tpl)
+        self._tpl_close = self._read_tpl(self.restart_close_tpl)
+        if self.restart_tpl:
+            self._log("接盘模板载入: 再来一局=%s 关弹窗=%s" % (
+                "OK" if self._tpl_restart is not None else "失败",
+                "OK" if self._tpl_close is not None else "未设置/失败"))
+
+    def _match_template(self, frame, tpl):
+        """在 frame 里找 tpl，返回窗口坐标 ``(cx, cy, score)`` 或 None。"""
+        if frame is None or tpl is None:
+            return None
+        fh, fw = frame.shape[:2]
+        th, tw = tpl.shape[:2]
+        if th > fh or tw > fw:
+            return None
+        try:
+            res = cv2.matchTemplate(frame, tpl, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        except Exception:
+            return None
+        if max_val < self.restart_match:
+            return None
+        return (max_loc[0] + tw / 2.0, max_loc[1] + th / 2.0, float(max_val))
+
+    def _click_window_point(self, hwnd: int, cap, cx: float, cy: float,
+                            what: str) -> bool:
+        """把窗口内坐标换算成屏幕坐标并点击（带前台/遮挡硬闸门）。"""
+        sx, sy = cap[0] + cx, cap[1] + cy
+        if not ensure_foreground(hwnd):
+            self._log(f"接盘：无法置前，跳过点击（{what}）")
+            return False
+        if not is_point_on_window(hwnd, sx, sy):
+            self._log(f"接盘：点击点被遮挡，跳过（{what}）")
+            return False
+        if self._clicker is None:
+            self._clicker = MouseClicker(mode="two_click", move_steps=1)
+        try:
+            self._clicker.click_at(sx, sy)
+        except Exception as exc:
+            self.error.emit(f"接盘点击失败: {exc}")
+            return False
+        self._log(f"接盘：已点击{what} ({sx:.0f},{sy:.0f})")
+        return True
+
+    def _try_click_restart(self) -> bool:
+        """循环尝试：找到「再来一局」就点；只找到「关闭弹窗」就先关掉再试。
+
+        天天象棋打完一局可能连弹「段位升级」「财源广进」「获得徽章」等好几个
+        窗口，把结算面板的「再来一局」盖住 —— 所以必须先逐个关掉弹窗。
+        返回 True 表示已经点到「再来一局」。
+        """
+        hwnd = self.source.hwnd
+        if not hwnd or self._tpl_restart is None:
+            return False
+        for attempt in range(max(1, int(self.restart_tries))):
+            saved = self.source.rect
+            try:
+                frame = self.source.grab()
+                cap = self.source.rect
+            finally:
+                # 抓帧会改写 source.rect，这里必须还原，否则自动走棋的坐标
+                # 换算会用到接盘时的陈旧矩形
+                self.source.rect = saved
+            if frame is None or cap is None:
+                time.sleep(0.5)
+                continue
+
+            hit = self._match_template(frame, self._tpl_restart)
+            if hit is not None:
+                self.status.emit(f"自动接盘：找到「再来一局」(相似度 {hit[2]:.2f})")
+                return self._click_window_point(hwnd, cap, hit[0], hit[1],
+                                                "「再来一局」")
+
+            close = self._match_template(frame, self._tpl_close)
+            if close is not None:
+                self.status.emit(f"自动接盘：先关掉弹窗 (相似度 {close[2]:.2f})")
+                self._click_window_point(hwnd, cap, close[0], close[1],
+                                         "弹窗关闭键")
+                time.sleep(1.2)
+                continue
+
+            self._log(f"接盘第 {attempt + 1} 次：未找到模板，稍后重试")
+            time.sleep(1.0)
+        return False
+
+    def _check_game_over(self) -> None:
+        """终局判定 + 自动接盘。**每轮循环都调用**（内部按 1s 节流）。
+
+        ★ 必须在主循环里调用，不能只在「局面被采纳」时调用 —— 终局的特征
+        恰恰是**局面不再变化**，挂在采纳分支上永远不会触发。
+        """
+        now = time.perf_counter()
+        if now - self._last_over_check < 1.0:
+            return                                  # 节流：no_moves 枚举不便宜
+        self._last_over_check = now
+        if not self._cur_fen_base:
+            return
+        fen = fen_with_side(self._cur_fen_base, self._cur_side)
+        if self._no_change_since == 0.0:
+            self._no_change_since = now
+
+        try:
+            no_move = has_no_legal_moves(fen)
+        except Exception:
+            no_move = False
+        stalled = (now - self._no_change_since) >= self.restart_wait
+        why = game_over_decision(no_move, stalled, self.restart_stall_fallback)
+        if not why:
+            self._game_over = False                 # 局面又活了（新一局/误判回退）
+            return
+        if self._game_over:
+            self._verify_restart(now)
+            return                                  # 已判定，别重复刷提示
+        self._game_over = True
+        self._log(f"判定本局结束：{why}  FEN={fen}")
+        try:
+            self.game_state.emit({"over": True, "note": why, "restarted": False})
+        except Exception:
+            pass
+
+        if self.auto_restart:
+            if self._tpl_restart is not None:
+                self._do_restart(why)
+            else:
+                self.status.emit(
+                    "自动接盘：尚未标定「再来一局」按钮（请先框选录模板），本次只提示")
+                self._log("接盘跳过：没有「再来一局」模板")
+
+    def _verify_restart(self, now: float) -> None:
+        """接盘后校验：点击后迟迟不出现新对局就提示用户，避免"静默失败"。
+
+        判据：局面发生新变化（``_no_change_since`` 晚于点击时刻）即视为新对局
+        已开始；超过 ``restart_verify_s`` 仍无变化则提示标定可能有问题。
+        """
+        t = self._restart_pending_t
+        if not t:
+            return
+        if self._no_change_since > t:
+            self._restart_pending_t = 0.0
+            self._game_over = False
+            self._log("接盘生效：已检测到新对局")
+            return
+        if now - t >= self.restart_verify_s:
+            self._restart_pending_t = 0.0
+            # 保持 _game_over=True，不自动重试（避免反复点同一个位置）
+            self.status.emit(
+                "自动接盘：点击后未检测到新对局，请检查「再来一局」按钮标定")
+            self._log("接盘未生效：点击后局面始终未变化")
+
+    def _do_restart(self, why: str) -> None:
+        """用**模板匹配**找到「再来一局」并点击（顺带逐个关掉挡路的弹窗）。
+
+        用模板而不是固定坐标：天天象棋打完一局会连弹「段位升级」「财源广进」
+        「获得徽章」等窗口，把结算面板挤动甚至盖住 —— 固定坐标点不到，
+        模板匹配仍能找到。
+        """
+        hwnd = self.source.hwnd
+        if not hwnd:
+            return
+        if not self._try_click_restart():
+            self.status.emit(
+                "自动接盘：没能找到「再来一局」按钮（检查模板是否录对/是否被遮挡）")
+            self._log(f"接盘失败：模板未命中（原因：{why}）")
+            return
+
+        # 重置局面跟踪，让下一帧被当作「初始局面」重新接手
+        try:
+            if self._tracker is not None:
+                self._tracker.reset()
+        except Exception:
+            pass
+        self._published = ""
+        self._last_key = ""
+        self._same = 0
+        self._auto_done = ("", "")
+        self._auto_pending = None
+        self._auto_moves_made = 0
+        self._no_change_since = time.perf_counter()
+        self._restart_pending_t = self._no_change_since   # 待校验「是否真的开了新局」
+        self._prev_gray = None                      # 画面已整体刷新
+        self.status.emit("自动接盘：已点击「再来一局」，等待新对局…")
+        try:
+            self.game_state.emit({"over": True, "note": why, "restarted": True})
+        except Exception:
+            pass
+
     # ---- 主线程 → Worker 的命令入口（线程安全，只往队列里塞）----
     def post_params(self, params: dict) -> None:
         """提交引擎参数变更（主线程调用）。"""
@@ -932,6 +1781,26 @@ class Worker(QObject):
         """提交自动走棋参数变更（主线程调用）。"""
         self._cmds.put(("auto", params))
 
+    def post_book(self, params: dict) -> None:
+        """提交开局库参数变更（主线程调用）。"""
+        self._cmds.put(("book", params))
+
+    def post_restart(self, params: dict) -> None:
+        """提交自动接盘参数变更（主线程调用）。"""
+        self._cmds.put(("restart", params))
+
+    def post_settle(self, params: dict) -> None:
+        """提交识别稳定（动画抑制）参数变更（主线程调用）。"""
+        self._cmds.put(("settle", params))
+
+    def post_newgame(self, params: dict) -> None:
+        """请求开新局（重置局面跟踪 + 自动判断我方执子）。主线程调用。"""
+        self._cmds.put(("newgame", params or {}))
+
+    def post_my_side(self, side: str) -> None:
+        """提交「我方执子」变更（主线程调用）。"""
+        self._cmds.put(("myside", side))
+
     def _process_commands(self) -> None:
         """在 Worker 线程内消费命令队列（循环顶部调用）。
 
@@ -940,7 +1809,13 @@ class Worker(QObject):
         """
         last_params = None
         last_auto = None
+        last_book = None
+        last_restart = None
+        last_settle = None
         do_clear = False
+        do_newgame = False
+        newgame_auto_side = True
+        last_myside = None
         drained = False
         while True:
             try:
@@ -952,6 +1827,18 @@ class Worker(QObject):
                 last_params = payload
             elif kind == "auto":
                 last_auto = payload
+            elif kind == "book":
+                last_book = payload
+            elif kind == "restart":
+                last_restart = payload
+            elif kind == "settle":
+                last_settle = payload
+            elif kind == "newgame":
+                do_newgame = True
+                if isinstance(payload, dict) and "auto_side" in payload:
+                    newgame_auto_side = bool(payload["auto_side"])
+            elif kind == "myside":
+                last_myside = payload
             elif kind == "clear":
                 do_clear = True
         if not drained:
@@ -961,6 +1848,29 @@ class Worker(QObject):
                 self.clear_hash_requested()
             except Exception as exc:
                 self.error.emit(f"清空置换表失败: {exc}")
+        if last_myside in ("w", "b"):
+            self.my_side = last_myside
+            self._log(f"我方执子改为：{last_myside}")
+        if do_newgame:
+            try:
+                self.apply_newgame(newgame_auto_side)
+            except Exception as exc:
+                self.error.emit(f"开新局失败: {exc}")
+        if last_settle is not None:
+            try:
+                self.apply_settle_params(last_settle)
+            except Exception as exc:
+                self.error.emit(f"识别稳定参数失败: {exc}")
+        if last_book is not None:
+            try:
+                self.apply_book_params(last_book)
+            except Exception as exc:
+                self.error.emit(f"开局库参数失败: {exc}")
+        if last_restart is not None:
+            try:
+                self.apply_restart_params(last_restart)
+            except Exception as exc:
+                self.error.emit(f"自动接盘参数失败: {exc}")
         if last_params is not None:
             try:
                 self.apply_engine_params(last_params)
@@ -971,6 +1881,103 @@ class Worker(QObject):
                 self.apply_auto_params(last_auto)
             except Exception as exc:
                 self.error.emit(f"自动走棋参数失败: {exc}")
+
+    def apply_settle_params(self, p: dict) -> None:
+        """应用识别稳定（动画抑制）参数（Worker 线程内调用）。"""
+        self.anim_suppress = bool(p.get("suppress", self.anim_suppress))
+        try:
+            self.settle_ms = max(0, int(p.get("settle_ms", self.settle_ms)))
+        except Exception:
+            pass
+        try:
+            self.motion_thresh = min(0.5, max(0.0,
+                                              float(p.get("thresh",
+                                                          self.motion_thresh))))
+        except Exception:
+            pass
+        if not self.anim_suppress:
+            self._settling = False
+            self._still_since = 0.0
+            self._settle_start = 0.0
+        # ★ 关闭期间 _prev_gray 不再更新，重新开启时它已陈旧 —— 不清掉的话
+        #   第一帧会拿「很久以前的画面」做比较，必然误判成「在动」。
+        self._prev_gray = None
+        try:
+            self.settle_state.emit({"suppress": self.anim_suppress,
+                                    "settling": False,
+                                    "ratio": 0.0,
+                                    "settle_ms": self.settle_ms,
+                                    "thresh": self.motion_thresh})
+        except Exception:
+            pass
+
+    def apply_newgame(self, auto_side: bool = True) -> None:
+        """开新局：清空局面跟踪 + 武装「自动判断我方执子」。
+
+        为什么必须有这个：新开一局时，上一局的局面 / 轮次 / 计数 / 终局标记
+        全都不能留 —— 否则演化校验会把新局的第一帧当成「无法解释的局面」
+        一直挡下来（表现为状态栏一直刷「局面变化无法解释，已挡下」）。
+        """
+        try:
+            if self._tracker is not None:
+                self._tracker.reset()
+        except Exception:
+            pass
+        self._published = ""
+        self._last_key = ""
+        self._same = 0
+        self._cur_fen_base = ""
+        self._cur_rows = None
+        self._cur_ctx = {}
+        self._auto_done = ("", "")
+        self._auto_pending = None
+        self._auto_retries = 0
+        self._auto_moves_made = 0
+        self._auto_next_click_t = 0.0       # 冷却时间戳一并清零，否则新局首手会被压住
+        self._auto_last_click_t = 0.0
+        self._turn_checked = False
+        self._last_emit = 0.0
+        self._book_move = None
+        self._last_bestmove = ""
+        self._last_bestmove_fen = ""
+        self._game_over = False
+        self._restart_pending_t = 0.0
+        self._no_change_since = time.perf_counter()
+        self._prev_gray = None
+        self._settle_start = 0.0
+        self._still_since = 0.0
+        self._settling = False
+        try:
+            self._pv.clear()
+        except Exception:
+            pass
+        try:
+            self._cn_cache.clear()
+        except Exception:
+            pass
+        try:
+            self._stop_search()
+        except Exception:
+            pass
+
+        self.auto_side_pending = bool(auto_side)
+        self._side_note = ""
+        # ★ 新局轮次按**规则**用「红方先手」：象棋红先，新局时红方还没动子。
+        #   （不能按 my_side —— 执黑时会把轮次设反，真点模式会走出不该走的着法。）
+        #   猜错由「双方合法性自纠」兜底，自动走棋另有硬闸门。
+        self._cur_side = "w"
+        try:
+            if self._tracker is not None:
+                self._tracker.side_to_move = "w"
+        except Exception:
+            pass
+        self.status.emit("已开新局：正在自动判断我方执子…" if auto_side
+                         else "已开新局：局面跟踪已重置")
+        try:
+            self.game_state.emit({"over": False, "restarted": False,
+                                  "note": "已开新局"})
+        except Exception:
+            pass
 
     def apply_engine_params(self, params: dict) -> None:
         """运行中热改引擎参数：停当前搜索 → 下发 → 用新参数重跑当前局面。"""
@@ -1200,6 +2207,17 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         # 高级面板：控件引用 {name: (widget, type, default)}
         self.adv_controls: dict = {}
+        # 自动接盘的按钮模板（PNG）。用「截图框选」录制，不靠固定坐标 ——
+        # 平台改版/分辨率变化/弹窗挤压时固定坐标会失效，模板匹配仍能找到。
+        self._restart_tpl = ""
+        self._restart_close_tpl = ""
+        # 未开始分析时点了「新局」→ 记住，等 start() 时立刻自动判断
+        self._newgame_armed = False
+        for _which, _attr in (("restart", "_restart_tpl"),
+                              ("close", "_restart_close_tpl")):
+            _p = self._tpl_path(_which)
+            if _p.is_file():
+                setattr(self, _attr, str(_p))
         dpi = enable_dpi_awareness()
 
         # ---- 左：棋盘 ----
@@ -1265,6 +2283,9 @@ class MainWindow(QMainWindow):
 
         right = QVBoxLayout()
         right.addWidget(self._build_automove_panel())   # 自动走棋（置顶，安全相关）
+        right.addWidget(self._build_book_panel())       # 开局库
+        right.addWidget(self._build_settle_panel())     # 识别稳定（动画抑制）
+        right.addWidget(self._build_restart_panel())    # 自动接盘
         right.addWidget(engine_grp)
         right.addWidget(info)
         right.addWidget(alt, 1)
@@ -1303,29 +2324,31 @@ class MainWindow(QMainWindow):
             "不勾选则每次识别到新局面，按「思考」时间分析一次。")
         self.chk_infinite.toggled.connect(self._on_infinite_toggled)
 
-        self.combo_side = QComboBox()
-        self.combo_side.addItem("红方先行", "w")
-        self.combo_side.addItem("黑方先行", "b")
-        self.combo_side.setToolTip(
-            "开局轮次（该谁先走）。识别看不出轮到谁走，只能先猜；\n"
-            "若猜错，引擎着法的合法性会在第一次分析后自动纠正。")
-
-        # 我方执子方 —— 与「先手」是两个独立维度：
-        # 「先手」决定该谁走，「我方执子」只决定左栏显示朝向。
-        # 识别模型的拉正流程按内容摆正棋盘（黑方底线恒在 row 0），
-        # 所以这个选项不再影响局面识别，只决定「左栏显示图朝哪边」
-        # （执黑时把显示图转 180°，让我方在下）。
+        # 我方执子：决定「谁是我方」—— 影响左栏显示朝向、自动走棋「只走我方」
+        # 的闸门，以及胜率视角。默认由「新局」自动判断。
+        # ★ 原来的「先手」下拉已移除：分析时默认按「轮到我方」处理，
+        #   而且 BoardTracker 会在观察到第一次走子时自动纠正轮次（双方合法性自纠），
+        #   所以开局猜错也能自愈。
         self.combo_my_side = QComboBox()
         self.combo_my_side.addItem("我方执红", "w")
         self.combo_my_side.addItem("我方执黑", "b")
         self.combo_my_side.setToolTip(
             "你在这局里执哪一方。\n"
             "识别模型会自动把棋盘摆正（谁在下都能正确识别），\n"
-            "此项只影响：左栏盘面朝向我方。\n"
-            "「当前建议」栏的胜率按红/黑方绝对视角给出，与本项无关。\n"
-            "选错不会导致局面颠倒，只会让左栏朝向反着。")
+            "此项决定：左栏盘面朝向我方、自动走棋只走我方。\n"
+            "点「新局」会自动判断（象棋客户端都把己方摆在画面下方）。")
+        self.combo_my_side.currentIndexChanged.connect(self._on_my_side_changed)
 
-        self.btn_run = QPushButton("开始")
+        self.btn_newgame = QPushButton("新局")
+        self.btn_newgame.setMinimumWidth(64)
+        self.btn_newgame.setToolTip(
+            "开新一局：清空局面跟踪（避免上一局的局面/轮次残留把新局挡下），\n"
+            "并**自动判断我方执子** —— 按「己方棋子摆在画面下方」这个\n"
+            "所有象棋客户端通用的约定，开局红方还没动子也能判。\n"
+            "若对局还在匹配中、棋盘还没出现，会自动重试，出现后立刻判定。")
+        self.btn_newgame.clicked.connect(self._on_new_game)
+
+        self.btn_run = QPushButton("分析")
         self.btn_run.setMinimumWidth(96)
         self.btn_run.clicked.connect(self.toggle)
 
@@ -1336,9 +2359,8 @@ class MainWindow(QMainWindow):
         top.addSpacing(10)
         top.addWidget(QLabel("我方执子"))
         top.addWidget(self.combo_my_side)
+        top.addWidget(self.btn_newgame)
         top.addSpacing(6)
-        top.addWidget(QLabel("先手"))
-        top.addWidget(self.combo_side)
         top.addWidget(QLabel("思考"))
         top.addWidget(self.spin_mt)
         top.addWidget(self.chk_infinite)
@@ -1360,7 +2382,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"DPI: {dpi} · 就绪")
         self.refresh_windows()
         self._load_auto_config()
-        self._update_auto_indicator(self.chk_auto.isChecked())
+        self._update_auto_indicator(self._auto_mode() != "off")
+        self._refresh_restart_tpl_labels(bool(self._restart_tpl),
+                                         bool(self._restart_close_tpl))
 
     # ---------------- 引擎参数面板 ----------------
     def _build_engine_panel(self) -> QGroupBox:
@@ -1435,6 +2459,464 @@ class MainWindow(QMainWindow):
         self.btn_clear_hash.clicked.connect(self._on_clear_hash)
         return grp
 
+    # ---------------- 开局库面板 ----------------
+    def _build_book_panel(self) -> QGroupBox:
+        """构建「开局库」面板（默认折叠）。
+
+        官方 Pikafish 二进制不带开局库（实测其 UCI 选项里没有任何库选项），
+        所以库在应用层做：查库命中就用库着，库外仍由引擎计算。
+        """
+        grp = QGroupBox("开局库（应用层实现）")
+        grp.setCheckable(True)
+        grp.setChecked(False)
+
+        outer = QVBoxLayout(grp)
+        outer.setContentsMargins(6, 6, 6, 6)
+
+        self.lbl_book_state = QLabel("未启用")
+        self.lbl_book_state.setWordWrap(True)
+        self.lbl_book_state.setStyleSheet("color:#98a2b0; font-size:11px;")
+        outer.addWidget(self.lbl_book_state)
+
+        body = QWidget()
+        grid = QGridLayout(body)
+        grid.setContentsMargins(0, 0, 0, 0)
+
+        self.chk_book = QCheckBox("启用开局库")
+        self.chk_book.setToolTip(
+            "查库命中时用库着（开局更稳更快），库外仍由引擎计算。\n"
+            "支持 .obk（社区实际流通的格式，如「云霄剑诀」）与 .xqb、\n"
+            "以及 .txt/.json 线路库。")
+
+        self.edit_book = QLineEdit()
+        self.edit_book.setPlaceholderText("选择开局库文件…")
+        self.edit_book.setReadOnly(True)
+        btn_browse = QPushButton("浏览…")
+        btn_browse.clicked.connect(self._on_pick_book)
+
+        self.combo_book_mode = QComboBox()
+        self.combo_book_mode.addItem("库着优先（自动走棋走库着）", "play")
+        self.combo_book_mode.addItem("仅提示（不影响走棋）", "hint")
+        self.combo_book_mode.setToolTip(
+            "库着优先：命中时「当前建议」与自动走棋都用库着。\n"
+            "仅提示：只在面板上显示库着，不影响引擎与自动走棋。")
+
+        self.spin_book_ply = QSpinBox()
+        self.spin_book_ply.setRange(0, 200)
+        self.spin_book_ply.setValue(40)
+        self.spin_book_ply.setSuffix(" 手")
+        self.spin_book_ply.setToolTip("只在前 N 手内用库；0 = 不限制。")
+
+        self.lbl_book_hit = QLabel("—")
+        self.lbl_book_hit.setWordWrap(True)
+        self.lbl_book_hit.setStyleSheet("color:#2f6f4f; font-size:11px;")
+
+        grid.addWidget(self.chk_book, 0, 0, 1, 2)
+        grid.addWidget(self.edit_book, 1, 0)
+        grid.addWidget(btn_browse, 1, 1)
+        grid.addWidget(QLabel("库着策略"), 2, 0)
+        grid.addWidget(self.combo_book_mode, 2, 1)
+        grid.addWidget(QLabel("库深度"), 3, 0)
+        grid.addWidget(self.spin_book_ply, 3, 1)
+        grid.addWidget(self.lbl_book_hit, 4, 0, 1, 2)
+        outer.addWidget(body)
+
+        body.setVisible(False)
+        grp.toggled.connect(body.setVisible)
+
+        self.chk_book.toggled.connect(self._on_book_changed)
+        self.combo_book_mode.currentIndexChanged.connect(self._on_book_changed)
+        self.spin_book_ply.valueChanged.connect(self._on_book_changed)
+        return grp
+
+    def _collect_book_params(self) -> dict:
+        return {
+            "enabled": self.chk_book.isChecked(),
+            "path": self.edit_book.text().strip(),
+            "mode": self.combo_book_mode.currentData() or "play",
+            "max_ply": self.spin_book_ply.value(),
+        }
+
+    @safe_slot
+    def _on_pick_book(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择开局库文件", str(app_base()),
+            "开局库 (*.obk *.xqb *.txt *.json);;obk 开局库 (*.obk);;"
+            "xqb 开局库 (*.xqb);;线路库 (*.txt *.json);;所有文件 (*)")
+        if not path:
+            return
+        self.edit_book.setText(path)
+        self.chk_book.setChecked(True)          # 选完文件即启用
+        self._on_book_changed()
+
+    def _on_book_changed(self, *_args) -> None:
+        if self.worker is not None:
+            self.worker.post_book(self._collect_book_params())
+
+    @Slot(dict)
+    def on_book_state(self, d: dict) -> None:
+        if not hasattr(self, "lbl_book_state"):
+            return
+        if not d.get("enabled"):
+            self.lbl_book_state.setText("未启用")
+        elif d.get("ok"):
+            self.lbl_book_state.setText(f"已加载：{d.get('note', '')}")
+        else:
+            self.lbl_book_state.setText(f"⚠ {d.get('note', '加载失败')}")
+        self._show_book_hit(d.get("hit"))
+
+    def _show_book_hit(self, hit) -> None:
+        if not hasattr(self, "lbl_book_hit"):
+            return
+        if hit:
+            self.lbl_book_hit.setText(
+                f"当前命中库着：{hit.get('chinese', '')}"
+                f"（{hit.get('move', '')}）权重 {hit.get('weight', 1)}")
+        else:
+            self.lbl_book_hit.setText("当前局面未命中开局库")
+
+    # ---------------- 识别稳定（动画抑制）面板 ----------------
+    def _build_settle_panel(self) -> QGroupBox:
+        """构建「识别稳定」面板（默认折叠，但功能默认开启）。
+
+        天天象棋吃子时棋盘中间会弹「吃」字动画，遮住盘面导致识别出错。
+        开启后：检测到画面正在变化就暂停识别，直到画面静止达到设定时长才
+        继续 —— 即「等动画消失后再识别盘面变化，有变化了再移动棋子」。
+        """
+        grp = QGroupBox("识别稳定（动画抑制）")
+        grp.setCheckable(True)
+        grp.setChecked(False)
+
+        outer = QVBoxLayout(grp)
+        outer.setContentsMargins(6, 6, 6, 6)
+
+        self.lbl_settle_state = QLabel("—")
+        self.lbl_settle_state.setWordWrap(True)
+        self.lbl_settle_state.setStyleSheet("color:#98a2b0; font-size:11px;")
+        outer.addWidget(self.lbl_settle_state)
+
+        body = QWidget()
+        grid = QGridLayout(body)
+        grid.setContentsMargins(0, 0, 0, 0)
+
+        self.chk_anim = QCheckBox("等画面静止后再识别")
+        self.chk_anim.setChecked(True)
+        self.chk_anim.setToolTip(
+            "开启后：帧间像素差异超过阈值即视为「画面在动」（吃子动画、\n"
+            "落子动画、窗口刷新等），暂停识别；画面静止达到设定时长才恢复。\n"
+            "这是针对天天象棋「吃」字动画遮挡盘面的核心修复。")
+
+        self.spin_settle = QSpinBox()
+        self.spin_settle.setRange(0, 3000)
+        self.spin_settle.setSingleStep(100)
+        self.spin_settle.setValue(400)
+        self.spin_settle.setSuffix(" ms")
+        self.spin_settle.setToolTip(
+            "画面必须持续静止这么久才恢复识别。\n"
+            "动画较长时可加大；觉得反应慢可减小。")
+
+        self.spin_thresh = QDoubleSpinBox()
+        self.spin_thresh.setRange(0.0, 0.5)
+        self.spin_thresh.setSingleStep(0.005)
+        self.spin_thresh.setDecimals(3)
+        self.spin_thresh.setValue(0.02)
+        self.spin_thresh.setToolTip(
+            "帧间「变化像素」占比超过此值就算画面在动。\n"
+            "默认 0.02（2%）。误报多就调大，漏检动画就调小。")
+
+        grid.addWidget(self.chk_anim, 0, 0, 1, 2)
+        grid.addWidget(QLabel("静置时长"), 1, 0)
+        grid.addWidget(self.spin_settle, 1, 1)
+        grid.addWidget(QLabel("变化阈值"), 2, 0)
+        grid.addWidget(self.spin_thresh, 2, 1)
+        outer.addWidget(body)
+
+        body.setVisible(False)
+        grp.toggled.connect(body.setVisible)
+
+        self.chk_anim.toggled.connect(self._on_settle_changed)
+        self.spin_settle.valueChanged.connect(self._on_settle_changed)
+        self.spin_thresh.valueChanged.connect(self._on_settle_changed)
+        return grp
+
+    def _collect_settle_params(self) -> dict:
+        return {
+            "suppress": self.chk_anim.isChecked(),
+            "settle_ms": self.spin_settle.value(),
+            "thresh": float(self.spin_thresh.value()),
+        }
+
+    def _on_settle_changed(self, *_args) -> None:
+        if self.worker is not None:
+            self.worker.post_settle(self._collect_settle_params())
+
+    @Slot(dict)
+    def on_settle_state(self, d: dict) -> None:
+        if not hasattr(self, "lbl_settle_state"):
+            return
+        if not d.get("suppress"):
+            self.lbl_settle_state.setText("已关闭（直接识别，不做稳定等待）")
+        elif d.get("settling"):
+            self.lbl_settle_state.setText(
+                f"画面变化中（{float(d.get('ratio', 0)) * 100:.1f}%），等待稳定…")
+        else:
+            self.lbl_settle_state.setText(
+                f"已启用 · 静置 {d.get('settle_ms', self.spin_settle.value())} ms "
+                f"· 阈值 {d.get('thresh', self.spin_thresh.value()):.3f}")
+
+    # ---------------- 自动接盘面板 ----------------
+    def _build_restart_panel(self) -> QGroupBox:
+        """构建「自动接盘」面板（默认折叠、功能默认关闭）。"""
+        grp = QGroupBox("自动接盘（一局结束后自动开下一局）")
+        grp.setCheckable(True)
+        grp.setChecked(False)
+
+        outer = QVBoxLayout(grp)
+        outer.setContentsMargins(6, 6, 6, 6)
+
+        self.lbl_restart_state = QLabel("—")
+        self.lbl_restart_state.setWordWrap(True)
+        self.lbl_restart_state.setStyleSheet("color:#98a2b0; font-size:11px;")
+        outer.addWidget(self.lbl_restart_state)
+
+        body = QWidget()
+        grid = QGridLayout(body)
+        grid.setContentsMargins(0, 0, 0, 0)
+
+        self.chk_restart = QCheckBox("启用自动接盘")
+        self.chk_restart.setToolTip(
+            "判定一局结束后，自动找到并点击「再来一局」按钮开下一局。\n"
+            "必须先框选录模板（见下），否则只提示、不点击。")
+
+        self.lbl_restart_pt = QLabel("『再来一局』：未标定")
+        self.lbl_restart_pt.setWordWrap(True)
+        self.btn_calib = QPushButton("① 框选『再来一局』按钮")
+        self.btn_calib.setToolTip(
+            "点开后弹出一张目标窗口的截图，在图上**拖拽框住**「再来一局」按钮即可。\n"
+            "在本程序里框选，不会误触目标窗口。")
+        self.btn_calib.clicked.connect(lambda: self._calibrate_template("restart"))
+
+        self.lbl_restart_close = QLabel("『关闭弹窗』：未标定（可选）")
+        self.lbl_restart_close.setWordWrap(True)
+        self.btn_calib_close = QPushButton("② 框选『关闭弹窗』按钮（可选）")
+        self.btn_calib_close.setToolTip(
+            "天天象棋打完一局可能连弹「段位升级」「财源广进」「获得徽章」等窗口，\n"
+            "把结算面板的「再来一局」盖住。框住这些弹窗的关闭键（X 或「确定」），\n"
+            "接盘时会先自动把它们逐个关掉，再点「再来一局」。\n"
+            "若你的平台不弹这些窗口，可以不标。")
+        self.btn_calib_close.clicked.connect(
+            lambda: self._calibrate_template("close"))
+
+        self.spin_restart_match = QDoubleSpinBox()
+        self.spin_restart_match.setRange(0.30, 0.99)
+        self.spin_restart_match.setSingleStep(0.01)
+        self.spin_restart_match.setDecimals(2)
+        self.spin_restart_match.setValue(0.80)
+        self.spin_restart_match.setToolTip(
+            "模板匹配的相似度阈值。\n"
+            "太高会找不到（尤其窗口缩放后），太低会误点。默认 0.80。")
+
+        self.spin_restart_wait = QSpinBox()
+        self.spin_restart_wait.setRange(3, 180)
+        self.spin_restart_wait.setValue(20)
+        self.spin_restart_wait.setSuffix(" s")
+        self.spin_restart_wait.setToolTip(
+            "局面停滞多久后参与「本局已结束」的判定。\n"
+            "太小会在对手长考时误判，太大则接盘不及时。")
+
+        self.chk_stall_fallback = QCheckBox("同时用「长时间停滞」兜底（可能误判）")
+        self.chk_stall_fallback.setChecked(False)
+        self.chk_stall_fallback.setToolTip(
+            "开启后：局面长时间不变也判定为本局结束。\n"
+            "用于对手认输 / 超时 / 平台弹出结算框但盘面仍可走的情况。\n"
+            "⚠ 对手长考超过「停滞判定」时间会被误判，请谨慎开启。\n"
+            "（「无合法着法」这条判定始终生效，不需要这个开关。）")
+
+        grid.addWidget(self.chk_restart, 0, 0, 1, 2)
+        grid.addWidget(self.btn_calib, 1, 0, 1, 2)
+        grid.addWidget(self.lbl_restart_pt, 2, 0, 1, 2)
+        grid.addWidget(self.btn_calib_close, 3, 0, 1, 2)
+        grid.addWidget(self.lbl_restart_close, 4, 0, 1, 2)
+        grid.addWidget(QLabel("匹配阈值"), 5, 0)
+        grid.addWidget(self.spin_restart_match, 5, 1)
+        grid.addWidget(QLabel("停滞判定"), 6, 0)
+        grid.addWidget(self.spin_restart_wait, 6, 1)
+        grid.addWidget(self.chk_stall_fallback, 7, 0, 1, 2)
+        outer.addWidget(body)
+
+        body.setVisible(False)
+        grp.toggled.connect(body.setVisible)
+
+        self.chk_restart.toggled.connect(self._on_restart_changed)
+        self.spin_restart_wait.valueChanged.connect(self._on_restart_changed)
+        self.spin_restart_match.valueChanged.connect(self._on_restart_changed)
+        self.chk_stall_fallback.toggled.connect(self._on_restart_changed)
+        return grp
+
+    def _collect_restart_params(self) -> dict:
+        return {
+            "enabled": self.chk_restart.isChecked(),
+            "tpl": self._restart_tpl,
+            "close_tpl": self._restart_close_tpl,
+            "match": float(self.spin_restart_match.value()),
+            "wait": float(self.spin_restart_wait.value()),
+            "stall_fallback": self.chk_stall_fallback.isChecked(),
+        }
+
+    def _on_restart_changed(self, *_args) -> None:
+        if self.worker is not None:
+            self.worker.post_restart(self._collect_restart_params())
+
+    def _refresh_restart_tpl_labels(self, has_restart: bool,
+                                    has_close: bool) -> None:
+        if hasattr(self, "lbl_restart_pt"):
+            self.lbl_restart_pt.setText(
+                "『再来一局』：✅ 已录模板" if has_restart
+                else "『再来一局』：未标定（必须先做这一步）")
+        if hasattr(self, "lbl_restart_close"):
+            self.lbl_restart_close.setText(
+                "『关闭弹窗』：✅ 已录模板" if has_close
+                else "『关闭弹窗』：未标定（可选）")
+
+    def _current_window(self) -> tuple[int, str] | None:
+        """取下拉框当前选中的 ``(hwnd, title)``；没选返回 None。
+
+        ★ ``itemData`` 存的是**元组** ``(hwnd, title)``，不是裸 hwnd。
+        直接 ``int(itemData(...))`` 会抛 TypeError，而 Qt 槽函数里的异常会被
+        PySide 打印到 stderr 后吞掉 —— 程序用 pythonw 启动没有控制台，
+        表现就是「点了按钮没反应」。这里统一收口，避免再踩。
+        """
+        data = self.combo.currentData()
+        if not data:
+            return None
+        try:
+            hwnd, title = data
+            return int(hwnd), str(title)
+        except Exception:
+            return None
+
+    @safe_slot
+    def _calibrate_template(self, which: str) -> None:
+        """抓一帧目标窗口 → 弹出截图 → 用户框选 → 存成模板 PNG。"""
+        cur = self._current_window()
+        if not cur:
+            QMessageBox.warning(self, "提示", "请先在顶部选择目标窗口")
+            return
+        hwnd, title = cur
+        if self.worker is not None:
+            QMessageBox.information(
+                self, "提示", "请先点「停止」再标定 —— 运行中抓帧会与识别线程互相干扰")
+            return
+
+        # 直接抓一帧（此时没有 Worker 在跑，不会与识别线程抢 source.rect）
+        self.source.attach(hwnd, title)
+        frame = self.source.grab()
+        if frame is None:
+            QMessageBox.warning(
+                self, "提示",
+                "抓帧失败。请确认目标窗口未最小化、未被其它窗口完全遮挡，"
+                "并且已经打开到能看到「再来一局」的画面。")
+            return
+
+        is_restart = which == "restart"
+        title = "框选『再来一局』按钮" if is_restart else "框选『关闭弹窗』按钮"
+        hint = (
+            "在下面的截图上按住鼠标左键拖拽，**框住**「再来一局」按钮（含文字即可）。\n"
+            "框好后点「确定」。"
+            if is_restart else
+            "在下面的截图上按住鼠标左键拖拽，**框住**弹窗的关闭键（右上角 X，"
+            "或「确定」按钮）。\n"
+            "天天象棋的「段位升级 / 财源广进 / 获得徽章」都用同一个位置即可。"
+            "框好后点「确定」。")
+        dlg = RegionSelectDialog(frame, self, title, hint)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        rect = dlg.selected_rect()
+        if not rect:
+            return
+        x, y, w, h = rect
+        tpl = frame[y:y + h, x:x + w]
+        if tpl.size == 0:
+            QMessageBox.warning(self, "提示", "框选区域为空，请重试")
+            return
+
+        path = self._tpl_path(which)
+        try:
+            # ★ 不能用 cv2.imwrite（非 ASCII 路径会失败），用 imencode + tofile
+            ok, buf = cv2.imencode(".png", tpl)
+            if not ok:
+                raise RuntimeError("imencode 失败")
+            buf.tofile(str(path))
+        except Exception as exc:
+            QMessageBox.warning(self, "提示", f"保存模板失败：{exc}")
+            return
+
+        if is_restart:
+            self._restart_tpl = str(path)
+        else:
+            self._restart_close_tpl = str(path)
+        self._refresh_restart_tpl_labels(bool(self._restart_tpl),
+                                         bool(self._restart_close_tpl))
+        self.statusBar().showMessage(
+            f"模板已保存：{path.name}（{w}×{h}）· 记得勾选「启用自动接盘」")
+        self._on_restart_changed()
+
+    def _tpl_path(self, which: str) -> Path:
+        name = "restart_btn.png" if which == "restart" else "restart_close.png"
+        return app_base() / name
+
+    @Slot(dict)
+    def on_game_state(self, d: dict) -> None:
+        if not hasattr(self, "lbl_restart_state"):
+            return
+        if "tpl" in d:
+            self._refresh_restart_tpl_labels(bool(d.get("tpl")),
+                                             bool(d.get("close_tpl")))
+        if d.get("restarted"):
+            self.lbl_restart_state.setText(f"已接盘：{d.get('note', '')}")
+        elif d.get("over"):
+            self.lbl_restart_state.setText(
+                f"本局已结束（{d.get('note', '')}）"
+                + ("" if self.chk_restart.isChecked() else " · 未启用自动接盘"))
+        else:
+            self.lbl_restart_state.setText("—")
+
+    # ---------------- 新局 / 我方执子 ----------------
+    @safe_slot
+    def _on_new_game(self) -> None:
+        """开新局：重置局面跟踪 + 自动判断我方执子。"""
+        if self.worker is not None:
+            self.worker.post_newgame({"auto_side": True})
+            self.statusBar().showMessage(
+                "已开新局：正在自动判断我方执子…（对局还在匹配中也没关系，"
+                "棋盘一出现就会判定）")
+        else:
+            # 还没开始分析：标记一下，点「分析」时 Worker 会立刻自动判断
+            self._newgame_armed = True
+            self.statusBar().showMessage(
+                "已标记新局 —— 点「分析」后会自动判断我方执子")
+
+    def _on_my_side_changed(self, *_args) -> None:
+        """手动改「我方执子」→ 立刻同步给正在跑的 Worker（走命令队列）。"""
+        side = self.combo_my_side.currentData() or "w"
+        if self.worker is not None:
+            self.worker.post_my_side(side)
+
+    @Slot(dict)
+    def on_side_detected(self, d: dict) -> None:
+        """Worker 自动判断出了我方执子 → 回填下拉框。"""
+        side = d.get("side")
+        if side not in ("w", "b"):
+            return
+        idx = self.combo_my_side.findData(side)
+        if idx >= 0:
+            self.combo_my_side.blockSignals(True)
+            self.combo_my_side.setCurrentIndex(idx)
+            self.combo_my_side.blockSignals(False)
+        self.statusBar().showMessage(
+            f"已自动判断我方执子：{self.combo_my_side.currentText()}"
+            f"（{d.get('why', '')}）")
+
     # ---------------- 自动走棋面板 ----------------
     def _build_automove_panel(self) -> QGroupBox:
         """构建「自动走棋」面板（默认折叠）。
@@ -1462,17 +2944,23 @@ class MainWindow(QMainWindow):
         grid = QGridLayout(body)
         grid.setContentsMargins(0, 0, 0, 0)
 
-        self.chk_auto = QCheckBox("启用自动走棋（只走我方）")
-        self.chk_auto.setToolTip(
-            "开启后：识别到轮到我方且局面稳定时，取引擎最佳着法，\n"
-            "用鼠标模拟点击「起点 → 终点」替我落子。\n"
+        # 走棋模式：三态**互斥**（关闭 / 预览 / 真点）。
+        # 需求要求「选其中一个另一个选不上」，所以用 QButtonGroup 做单选，
+        # 而不是两个可以同时勾上的复选框。默认「关闭」，最安全。
+        self.radio_off = QRadioButton("关闭自动走棋")
+        self.radio_off.setChecked(True)
+        self.radio_dry = QRadioButton("预览模式（只算不点）")
+        self.radio_dry.setToolTip(
+            "只把「将要点击的着法与坐标」显示出来，不真的动鼠标。\n"
+            "首次使用请先用这个模式确认坐标无误。")
+        self.radio_real = QRadioButton("启动走棋（真点落子）")
+        self.radio_real.setToolTip(
+            "真正模拟鼠标点击替我方落子。\n"
             "对手仍在真实平台上下棋，本程序不动对方棋子。")
-
-        self.chk_dry = QCheckBox("预览模式（只算不点）")
-        self.chk_dry.setChecked(True)
-        self.chk_dry.setToolTip(
-            "勾选时只把「将要点击的着法与坐标」显示出来，不真的动鼠标。\n"
-            "首次使用请先保持勾选，确认坐标无误后再取消。")
+        self.auto_mode_group = QButtonGroup(self)
+        for _r in (self.radio_off, self.radio_dry, self.radio_real):
+            self.auto_mode_group.addButton(_r)
+        self.auto_mode_group.setExclusive(True)
 
         self.spin_auto_think = QSpinBox()
         self.spin_auto_think.setRange(300, 10000)
@@ -1521,29 +3009,31 @@ class MainWindow(QMainWindow):
         self.lbl_auto_last.setWordWrap(True)
         self.lbl_auto_last.setStyleSheet("color:#98a2b0; font-size:11px;")
 
-        grid.addWidget(self.chk_auto, 0, 0, 1, 2)
-        grid.addWidget(self.chk_dry, 1, 0, 1, 2)
-        grid.addWidget(QLabel("思考时间"), 2, 0)
-        grid.addWidget(self.spin_auto_think, 2, 1)
-        grid.addWidget(QLabel("落子方式"), 3, 0)
-        grid.addWidget(self.combo_click_mode, 3, 1)
-        grid.addWidget(QLabel("落子冷却"), 4, 0)
-        grid.addWidget(self.spin_auto_cooldown, 4, 1)
-        grid.addWidget(QLabel("最大连续走子"), 5, 0)
-        grid.addWidget(self.spin_auto_max, 5, 1)
-        grid.addWidget(QLabel("移动插值步数"), 6, 0)
-        grid.addWidget(self.spin_steps, 6, 1)
-        grid.addWidget(self.chk_restore, 7, 0, 1, 2)
-        grid.addWidget(self.btn_auto_stop, 8, 0, 1, 2)
-        grid.addWidget(self.lbl_auto_last, 9, 0, 1, 2)
+        grid.addWidget(QLabel("走棋模式"), 0, 0)
+        grid.addWidget(self.radio_off, 0, 1)
+        grid.addWidget(self.radio_dry, 1, 0, 1, 2)
+        grid.addWidget(self.radio_real, 2, 0, 1, 2)
+        grid.addWidget(QLabel("思考时间"), 3, 0)
+        grid.addWidget(self.spin_auto_think, 3, 1)
+        grid.addWidget(QLabel("落子方式"), 4, 0)
+        grid.addWidget(self.combo_click_mode, 4, 1)
+        grid.addWidget(QLabel("落子冷却"), 5, 0)
+        grid.addWidget(self.spin_auto_cooldown, 5, 1)
+        grid.addWidget(QLabel("最大连续走子"), 6, 0)
+        grid.addWidget(self.spin_auto_max, 6, 1)
+        grid.addWidget(QLabel("移动插值步数"), 7, 0)
+        grid.addWidget(self.spin_steps, 7, 1)
+        grid.addWidget(self.chk_restore, 8, 0, 1, 2)
+        grid.addWidget(self.btn_auto_stop, 9, 0, 1, 2)
+        grid.addWidget(self.lbl_auto_last, 10, 0, 1, 2)
         outer.addWidget(body)
 
         body.setVisible(False)
         grp.toggled.connect(body.setVisible)
 
         # 控件变化 → 下发 Worker（信号最后连，避免构造期触发）
-        self.chk_auto.toggled.connect(self._on_auto_changed)
-        self.chk_dry.toggled.connect(self._on_auto_changed)
+        for _r in (self.radio_off, self.radio_dry, self.radio_real):
+            _r.toggled.connect(self._on_auto_changed)
         for w in (self.spin_auto_think, self.spin_auto_max, self.spin_steps):
             w.valueChanged.connect(self._on_auto_changed)
         self.spin_auto_cooldown.valueChanged.connect(self._on_auto_changed)
@@ -1551,11 +3041,35 @@ class MainWindow(QMainWindow):
         self.chk_restore.toggled.connect(self._on_auto_changed)
         return grp
 
+    # ---- 走棋模式三态（互斥）----
+    def _auto_mode(self) -> str:
+        """当前走棋模式：``'off'`` / ``'dry'`` / ``'real'``。"""
+        if self.radio_real.isChecked():
+            return "real"
+        if self.radio_dry.isChecked():
+            return "dry"
+        return "off"
+
+    def _set_auto_mode(self, mode: str) -> None:
+        """设置走棋模式（不回触发信号）。"""
+        target = {"real": self.radio_real,
+                  "dry": self.radio_dry}.get(mode, self.radio_off)
+        if target.isChecked():
+            return
+        for r in (self.radio_off, self.radio_dry, self.radio_real):
+            r.blockSignals(True)
+        target.setChecked(True)
+        for r in (self.radio_off, self.radio_dry, self.radio_real):
+            r.blockSignals(False)
+
     def _collect_auto_params(self) -> dict:
+        mode = self._auto_mode()
         return {
-            "enabled": self.chk_auto.isChecked(),
+            "enabled": mode != "off",
             "think_ms": self.spin_auto_think.value(),
-            "dry_run": self.chk_dry.isChecked(),
+            # 只有「真点」才不是预览；关闭时也报预览（避免误点）
+            "dry_run": mode != "real",
+            "mode": mode,
             "click_mode": self.combo_click_mode.currentData() or "two_click",
             "cooldown": float(self.spin_auto_cooldown.value()),
             "max_moves": self.spin_auto_max.value(),
@@ -1565,7 +3079,7 @@ class MainWindow(QMainWindow):
 
     def _on_auto_changed(self, *_args) -> None:
         """自动走棋参数变化 → 经命令队列下发（不能走 Qt 信号，见 post_params）。"""
-        on = self.chk_auto.isChecked()
+        on = self._auto_mode() != "off"
         # 自动走棋需要确定 bestmove，而「持续加深」永不返回 → 置灰
         inf = getattr(self, "chk_infinite", None)
         if inf is not None:
@@ -1577,13 +3091,14 @@ class MainWindow(QMainWindow):
 
     def _on_auto_stop(self) -> None:
         """紧急停止：只关自动走棋，不终止识别。"""
-        self.chk_auto.setChecked(False)
+        self._set_auto_mode("off")
+        self._on_auto_changed()
 
     def _update_auto_indicator(self, on: bool) -> None:
         if not hasattr(self, "lbl_auto_state"):
             return
         if on:
-            dry = self.chk_dry.isChecked()
+            dry = self._auto_mode() != "real"
             self.lbl_auto_state.setText(
                 "● 自动走棋运行中（预览）" if dry else "● 自动走棋运行中（真点）")
             self.lbl_auto_state.show()
@@ -1593,9 +3108,10 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def on_auto_state(self, on: bool) -> None:
         """Worker 通知自动走棋开关变化（含保险丝/重试超限导致的自动关闭）。"""
-        self.chk_auto.blockSignals(True)
-        self.chk_auto.setChecked(bool(on))
-        self.chk_auto.blockSignals(False)
+        if not on:
+            self._set_auto_mode("off")
+        elif self._auto_mode() == "off":
+            self._set_auto_mode("dry")          # 被外部打开时回到安全的预览态
         inf = getattr(self, "chk_infinite", None)
         if inf is not None:
             inf.setEnabled(not on)
@@ -1631,13 +3147,19 @@ class MainWindow(QMainWindow):
             data = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             return
-        widgets = (self.chk_auto, self.chk_dry, self.spin_auto_think,
-                   self.combo_click_mode, self.spin_auto_cooldown,
-                   self.spin_auto_max, self.chk_restore, self.spin_steps)
+        widgets = (self.radio_off, self.radio_dry, self.radio_real,
+                   self.spin_auto_think, self.combo_click_mode,
+                   self.spin_auto_cooldown, self.spin_auto_max,
+                   self.chk_restore, self.spin_steps)
         for w in widgets:
             w.blockSignals(True)
         try:
-            self.chk_dry.setChecked(bool(data.get("dry_run", True)))
+            # ★ 启动一律回到安全态：即使上次存的是「真点」，本次也只恢复成
+            #   「预览」，绝不因为读了个配置文件就开始点鼠标。
+            mode = str(data.get("mode", "dry"))
+            if mode not in ("off", "dry"):
+                mode = "dry"
+            self._set_auto_mode(mode)
             self.spin_auto_think.setValue(int(data.get("think_ms", 1200)))
             idx = self.combo_click_mode.findData(
                 str(data.get("click_mode", "two_click")))
@@ -1800,9 +3322,15 @@ class MainWindow(QMainWindow):
         if fen:
             self.lbl_fen.setText(fen)
         side_cn = "红方走" if diag.get("side") == "w" else "黑方走"
-        self.lbl_best.setText(
-            f"{diag.get('best') or '—'}   {diag.get('chinese', '')}")
+        best_txt = f"{diag.get('best') or '—'}   {diag.get('chinese', '')}"
+        if diag.get("book_used"):
+            best_txt += "   【开局库】"
+        self.lbl_best.setText(best_txt)
         self.lbl_winrate.setText(diag.get("winrate", "—"))
+
+        # 开局库命中情况（只有启用时才刷新这一行，避免覆盖「未启用」提示）
+        if diag.get("book_enabled"):
+            self._show_book_hit(diag.get("book"))
 
         sub = (f"{side_cn} · 分数 {diag.get('score', '—')} · "
                f"深度 {diag.get('depth') or '—'}")
@@ -1920,8 +3448,19 @@ class MainWindow(QMainWindow):
         self.worker = Worker(self.source)
         self.worker.movetime = self.spin_mt.value()
         self.worker.confirm = self.spin_conf.value()
-        self.worker.first_side = self.combo_side.currentData() or "w"
         self.worker.my_side = self.combo_my_side.currentData() or "w"
+        # 轮次（原「先手」下拉已删除）：
+        #   * 点过「新局」→ 按**规则**用「红方先手」（新局时红方还没动子）；
+        #   * 直接点「分析」→ 默认按「轮到我方」。
+        # 猜错也不怕，有两层兜底：
+        #   ① BoardTracker 观察到第一次走子时会做「双方合法性自纠」；
+        #   ② 自动走棋另有一道硬闸门，挡掉「盘面还是开局却认为轮到黑方」的情形。
+        self.worker.first_side = ("w" if self._newgame_armed
+                                  else (self.combo_my_side.currentData() or "w"))
+        if self._newgame_armed:
+            # 停止状态下点过「新局」→ 一开始分析就立刻自动判断执子
+            self.worker.auto_side_pending = True
+            self._newgame_armed = False
         # 引擎参数（可调）
         params = self._collect_engine_params()
         self.worker.threads = params["threads"]
@@ -1952,12 +3491,23 @@ class MainWindow(QMainWindow):
         self.worker.done.connect(self.on_done)
         self.worker.auto_state_changed.connect(self.on_auto_state)
         self.worker.auto_preview.connect(self.on_auto_preview)
+        self.worker.book_state.connect(self.on_book_state)
+        self.worker.settle_state.connect(self.on_settle_state)
+        self.worker.game_state.connect(self.on_game_state)
+        self.worker.side_detected.connect(self.on_side_detected)
         self.thread.start()
-        self._update_auto_indicator(self.chk_auto.isChecked())
+        # 开局库 / 识别稳定 / 自动接盘：走命令队列下发，由 Worker 线程自己应用
+        # （开局库必须在 Worker 线程里打开 sqlite 连接，见 apply_book_params）
+        try:
+            self.worker.post_book(self._collect_book_params())
+            self.worker.post_settle(self._collect_settle_params())
+            self.worker.post_restart(self._collect_restart_params())
+        except Exception:
+            pass
+        self._update_auto_indicator(self._auto_mode() != "off")
         self.btn_run.setText("停止")
         self.combo.setEnabled(False)
         self.combo_my_side.setEnabled(False)
-        self.combo_side.setEnabled(False)
 
     def stop(self) -> None:
         if self.worker:
@@ -2000,10 +3550,9 @@ class MainWindow(QMainWindow):
             self.thread.wait(3000)
         self.worker = None
         self.thread = None
-        self.btn_run.setText("开始")
+        self.btn_run.setText("分析")
         self.combo.setEnabled(True)
         self.combo_my_side.setEnabled(True)
-        self.combo_side.setEnabled(True)
         self._update_auto_indicator(False)
         self.statusBar().showMessage("已停止")
 
@@ -2028,6 +3577,10 @@ def main() -> int:
 
     if args.selftest:
         return selftest(args.image, args.movetime)
+
+    # ★ 装上全局异常钩子：pythonw 没有控制台，否则槽函数里的异常会被
+    #   PySide 静默吞掉，用户只看到「点了没反应」。
+    sys.excepthook = lambda t, e, tb: report_exception(e, where="excepthook")
 
     app = QApplication(sys.argv)
     win = MainWindow()

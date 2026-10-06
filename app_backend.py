@@ -23,7 +23,7 @@ import numpy as np
 
 # 版本号：同时用于窗口标题、运行日志与打包产物命名，
 # 便于用户确认自己用的是哪一版。
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 HERE = Path(__file__).resolve().parent
 
@@ -956,7 +956,12 @@ def is_legal_move(fen: str, iccs: str) -> bool:
 
 
 def enumerate_legal_moves(fen: str, timeout: float = 2.0) -> set[str]:
-    """枚举全部合法着法（ICCS 集合）。
+    """枚举全部**伪合法**着法（ICCS 集合）。
+
+    ⚠ 注意这是**伪合法**：``cchess.is_valid_iccs_move`` 只做「走子规则」检查
+    （其源码注释原文："只进行最基本的走子规则检查"），**不会**拒绝「走完之后
+    自己被将军」或「将帅照面」的着法。需要真合法请用 :func:`is_strict_legal_move`，
+    需要真终局判定请用 :func:`has_no_legal_moves`。
 
     实现方式是对 9x10 的坐标对做全枚举并用库接口校验。实测全量 8100 次
     校验约 0.12s，因此适合在中低频场景使用（例如分析候选着法）。
@@ -987,6 +992,44 @@ def enumerate_legal_moves(fen: str, timeout: float = 2.0) -> set[str]:
             if time.perf_counter() - t0 > timeout:
                 return out
     return out
+
+
+def is_strict_legal_move(fen: str, iccs: str) -> bool:
+    """**真**合法着法校验 —— 在伪合法之上再要求「走完不自将、不照面」。
+
+    做法：先过伪合法，再落子并把轮次交给对方，然后问「对方能否吃到我的将」
+    （``is_checking()`` 的语义就是"行棋方能否吃对方的将"）。能吃 → 我自将。
+
+    实测：``4k4/.../4K4`` 照面局面下红帅 e0e1 被正确判为非法；
+    ``R3k3R/4R4/...`` 杀局里黑将 e9d9/e9f9/e9e8 三个伪合法着法全部被判非法。
+    """
+    if not iccs or len(iccs) != 4:
+        return False
+    try:
+        from cchess import ChessBoard
+        board = ChessBoard(fen)
+        if not board.is_valid_iccs_move(iccs):
+            return False
+        if board.move_iccs(iccs) is None:
+            return False
+        board.next_turn()
+        return not board.is_checking()
+    except Exception:
+        return False
+
+
+def has_no_legal_moves(fen: str) -> bool:
+    """当前行棋方是否已无任何**真**合法着法（将死或困毙）。
+
+    直接复用 ``cchess`` 的 ``no_moves()`` —— 它内部对每个伪合法着法都调
+    ``is_checked_move()``（落子后检查自将），因此是**真**终局判定。
+    出错时返回 False（宁可漏判也不误判成终局）。
+    """
+    try:
+        from cchess import ChessBoard
+        return bool(ChessBoard(fen).no_moves())
+    except Exception:
+        return False
 
 
 def legal_moves(fen: str) -> set[str]:
@@ -1188,7 +1231,10 @@ def check_board_geometry(kps, min_area_frac: float = 0.04,
 
     * 四边形面积占画面比例不能过小
 
-    ``kps`` 顺序为 ``[A0, A8, J0, J8]``（左上、右上、左下、右下）。
+    ``kps`` 顺序为 ``[A0, A8, J0, J8]`` —— 这是**内容语义**的角点：
+    ``A0/A8`` 是**黑方**底线两角、``J0/J8`` 是**红方**底线两角
+    （见 ``xq_vision.BONE_NAMES``），与画面上下无关。拉正时 A 边被映射到
+    目标图的上边（即 FEN 的 row 0）。
     """
     try:
         import math
@@ -1199,7 +1245,8 @@ def check_board_geometry(kps, min_area_frac: float = 0.04,
             return False, f"角点形状异常 {pts.shape}"
         a0, a8, j0, j8 = pts
 
-        # 水平边：上边 A0-A8、下边 J0-J8
+        # A 边（黑方底线）：A0-A8；J 边（红方底线）：J0-J8
+        # 注意别把它们叫成「上边/下边」—— 谁在上取决于画面里谁在下。
         top = float(math.dist(a0, a8))
         bottom = float(math.dist(j0, j8))
         # 垂直边：左边 A0-J0、右边 A8-J8
@@ -1396,6 +1443,8 @@ class BoardTracker:
     因此对每个新识别出的局面做三重校验，满足其一才采信：
 
     1. 能由已确认局面**一步合法着法**解释 —— 正常走子，立即采信
+       （若这一步对**当前轮次**不合法、但对**另一方**合法，则判定轮次猜错了，
+        在**连续两次**看到同一着法后纠正轮次并采信，见 ``update``）
     2. 与上一帧识别结果一致（连续两帧）—— 稳定的新局面（例如刚接手
        中盘、或用户跳过了中间几步）
     3. 连续 ``force_after`` 帧都无法解释 —— 兜底采信，避免永久卡死，
@@ -1426,6 +1475,13 @@ class BoardTracker:
         self.forced = 0                         # 兜底采信次数
         self.corrections = 0                    # 轮次被校正次数
         self.moves: list[str] = []              # 已采信的着法序列
+        # 「轮次自纠」需要连续两次看到同一个着法才采信（见 update）
+        self._selfcorr_pending: tuple | None = None
+        self._selfcorr_count = 0
+
+    def _clear_selfcorr(self) -> None:
+        self._selfcorr_pending = None
+        self._selfcorr_count = 0
 
     # ---------------- 轮次 ----------------
 
@@ -1443,16 +1499,24 @@ class BoardTracker:
             return None
         return fen_with_side(self.stable_fen, self.side_to_move)
 
-    def _explain(self, prev: str, cur: str) -> str | None:
-        """cur 能否由 prev 走一步合法着法得到？返回该着法或 None。
+    def _explain_with(self, prev: str, cur: str, side: str) -> str | None:
+        """cur 能否由 prev 走一步**属于 ``side`` 的**合法着法得到？返回该着法或 None。
 
         先用纯格子差分拿候选着法，再用 cchess 校验合法性 —— 校验时必须
-        带上**当前轮次**，否则黑方着法会被判非法。
+        带上轮次，否则黑方着法会被判非法。
+
+        注：``is_valid_iccs_move`` 会校验「起点格棋子的颜色 == 行棋方」，所以
+        同一个差分着法**不可能**对红黑双方同时合法 —— 这正是 :meth:`update`
+        能靠它反推轮次的原因。
         """
         mv = diff_single_move(prev, cur)
         if mv is None:
             return None
-        return mv if is_legal_move(fen_with_side(prev, self.side_to_move), mv) else None
+        return mv if is_legal_move(fen_with_side(prev, side), mv) else None
+
+    def _explain(self, prev: str, cur: str) -> str | None:
+        """cur 能否由 prev 按**当前轮次**走一步合法着法得到？"""
+        return self._explain_with(prev, cur, self.side_to_move)
 
     # ---------------- 主入口 ----------------
 
@@ -1495,7 +1559,38 @@ class BoardTracker:
             self.pending_count = 0
             self.moves.append(mv)
             self.toggle_side()
+            self._clear_selfcorr()
             return True, "走子", mv, self.side_to_move
+
+        # ★ 轮次自纠：这一步虽然对当前轮次不合法，但对**另一方**合法 ——
+        #   说明开局时把「该谁走」猜错了。据此纠正轮次，不必等引擎兜底，
+        #   也避免轮次一直错下去导致演化校验把正常走子全挡掉。
+        #   （靠得住的前提：is_valid_iccs_move 会校验起点棋子的颜色，
+        #     同一个差分着法不可能对红黑双方同时合法。）
+        #
+        #   但要**连续两次**看到同一个着法才采信：单帧误识别也可能恰好凑出
+        #   「对另一方合法」的一步差分，直接采信会削弱本类赖以生存的噪声过滤。
+        other = "b" if self.side_to_move == "w" else "w"
+        mv_other = self._explain_with(self.stable_fen, board_only, other)
+        if mv_other:
+            if self._selfcorr_pending == (self.stable_fen, mv_other):
+                self._selfcorr_count += 1
+            else:
+                self._selfcorr_pending = (self.stable_fen, mv_other)
+                self._selfcorr_count = 1
+            if self._selfcorr_count >= 2:
+                self._clear_selfcorr()
+                self.side_to_move = other
+                self.corrections += 1
+                self.stable_fen = board_only
+                self.pending_fen = None
+                self.pending_count = 0
+                self.moves.append(mv_other)
+                self.toggle_side()
+                return True, "走子(轮次自纠)", mv_other, self.side_to_move
+            self.dropped += 1
+            return False, "drop", "", self.side_to_move
+        self._clear_selfcorr()
 
         if self.pending_fen is not None and board_only == self.pending_fen:
             self.pending_count += 1
@@ -1542,6 +1637,7 @@ class BoardTracker:
         self.forced = 0
         self.corrections = 0
         self.moves.clear()
+        self._clear_selfcorr()
 
     @property
     def stats(self) -> str:
