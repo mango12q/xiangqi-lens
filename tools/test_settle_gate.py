@@ -108,6 +108,7 @@ def main() -> int:
 
     from app_backend import ScreenSource
     w = Worker(ScreenSource())
+    check("默认开启动画抑制", w.anim_suppress is True)
     w.anim_suppress = True
     w.motion_thresh = 0.02
     check("默认最长抑制时长为正（防永久不识别）", w.anim_max_ms > 0,

@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""「新局 / 自动判断我方执子 / 轮次自纠」测试。
+"""「点分析自动判断我方执子 / 轮次自纠」测试。
 
-覆盖三件事：
+覆盖四件事：
 1. ``Worker._detect_my_side`` —— 从棋盘朝向判断我方执子，**含退化关键点的质量门**；
 2. ``BoardTracker`` 的**双方合法性自纠** —— 初始轮次猜错也能在第一次走子时纠正；
-3. ``apply_newgame`` 的重置，以及 ``_current_window()`` 对下拉框元组的解包
+3. ``Worker._apply_my_side`` —— 判定我方执子后**首帧轮次**怎么定
+   （初始局面按「红先」，中盘接手按「轮到我方」），以及手动选择优先；
+4. 界面：**「新局」按钮及其全部管线已移除**、手动改执子后「本次分析不再自动判断」
+   （分析结束即复位）、``_current_window()`` 对下拉框元组的解包
    （后者曾是「框选没反应」的根因）。
 
 不需要真实窗口与引擎（离屏起 Qt）。
@@ -26,6 +29,18 @@ FAIL = 0
 
 START_BOARD = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR"
 AFTER_H2E2 = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C2C4/9/RNBAKABNR"
+MID_BOARD = "rnbakab1r/9/1c4nc1/p1p1p1p1p/9/9/P1P1P1P1P/1C2C4/9/RNBAKABNR"
+
+
+def fen_to_rows(board: str) -> list[str]:
+    """把棋盘段 FEN 还原成 10x9 短标签矩阵（识别输出的形状）。"""
+    rows = []
+    for part in board.split("/"):
+        r = ""
+        for ch in part:
+            r += "." * int(ch) if ch.isdigit() else ch
+        rows.append(r)
+    return rows
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -39,7 +54,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def main() -> int:
-    print("=== 新局 / 我方执子 / 轮次自纠 测试 ===")
+    print("=== 自动判断我方执子 / 轮次自纠 测试 ===")
 
     from PySide6.QtWidgets import QApplication
     QApplication.instance() or QApplication([])
@@ -117,17 +132,8 @@ def main() -> int:
     ok, reason, _mv, _side = t3.update("9/9/9/9/9/9/9/9/9/9")
     check("无法解释的跳变仍被挡下", (not ok) and reason == "drop", reason)
 
-    # ---- 3. 新局行为 ----
-    print("\n③ 新局行为（停掉分析 + 武装自动判断）")
-    w0 = av.MainWindow()
-    check("初始未武装", w0._newgame_armed is False)
-    w0._on_new_game()                       # 停止态点「新局」
-    check("停止态点新局 → 武装待判执子", w0._newgame_armed is True)
-    check("提示用户点「分析」开始",
-          "点「分析」" in w0.statusBar().currentMessage(),
-          w0.statusBar().currentMessage())
-
-    # 新的 Worker 天生就是干净的 —— 不再需要 apply_newgame 去重置
+    # ---- 3. 判定执子后的首帧轮次（_apply_my_side）----
+    print("\n③ _apply_my_side：我方执子 + 首帧轮次")
     wk = av.Worker(ScreenSource())
     check("新 Worker 的 _published 为空", wk._published == "")
     check("新 Worker 还没有 tracker（run 里才建）", wk._tracker is None)
@@ -136,10 +142,64 @@ def main() -> int:
     check("新 Worker 默认轮次为红先", wk.first_side == "w", wk.first_side)
     check("新 Worker 默认线程 2 / 哈希 256",
           wk.threads == 2 and wk.hash_mb == 256, f"{wk.threads}/{wk.hash_mb}")
-    check("新 Worker 默认关闭动画抑制", wk.anim_suppress is False)
+    check("新 Worker 默认开启动画抑制", wk.anim_suppress is True)
 
-    # ---- 3b. 自动走棋的轮次硬闸门 ----
-    print("\n③b 自动走棋轮次闸门（_turn_guard_blocks）")
+    # 3a. tracker 还没采信任何局面 → 首帧轮次按规则定
+    a = av.Worker(ScreenSource())
+    a._tracker = BoardTracker(first_side="w")
+    got = []
+    a.side_detected.connect(lambda d: got.append(d))
+    a._apply_my_side("b", "黑方底线在画面下方", fen_to_rows(START_BOARD))
+    check("my_side 被设定", a.my_side == "b", a.my_side)
+    check("盘面为初始局面 → 首帧轮次改用「红先」",
+          a._tracker.side_to_move == "w", a._tracker.side_to_move)
+    check("广播 side_detected（回填下拉框用）",
+          got and got[-1].get("side") == "b", str(got))
+
+    b = av.Worker(ScreenSource())
+    b._tracker = BoardTracker(first_side="w")
+    b._apply_my_side("b", "黑方底线在画面下方", fen_to_rows(MID_BOARD))
+    check("中盘接手 → 首帧轮次 = 我方（默认轮到我方）",
+          b._tracker.side_to_move == "b", b._tracker.side_to_move)
+
+    c = av.Worker(ScreenSource())
+    c._tracker = BoardTracker(first_side="w")
+    c._apply_my_side("w", "红方底线在画面下方", fen_to_rows(MID_BOARD))
+    check("中盘接手且我方执红 → 轮次红方",
+          c._tracker.side_to_move == "w", c._tracker.side_to_move)
+
+    # 3b. 已经采信过局面 → 轮次归演化校验/自纠管，不能被覆盖
+    d = av.Worker(ScreenSource())
+    d._tracker = BoardTracker(first_side="w")
+    d._tracker.update(AFTER_H2E2)               # 采信一个中盘局面
+    before = d._tracker.side_to_move
+    d._apply_my_side("b", "判定执黑", fen_to_rows(START_BOARD))
+    check("已采信局面后不覆盖轮次",
+          d._tracker.side_to_move == before, f"{before} → {d._tracker.side_to_move}")
+    check("但 my_side 仍然更新", d.my_side == "b", d.my_side)
+
+    # 3c. 手动选择优先：不再广播（避免把用户的选择又改回去）
+    e = av.Worker(ScreenSource())
+    e.auto_side_pending = True
+    hits = []
+    e.side_detected.connect(lambda dd: hits.append(dd))
+    e.post_my_side("b")
+    e._process_commands()
+    check("手动选择后取消待自动判断", e.auto_side_pending is False)
+    check("手动选择生效", e.my_side == "b", e.my_side)
+    check("手动选择不广播 side_detected", hits == [], str(hits))
+
+    # 3d. 自动判断路径会广播（供界面回填下拉框）
+    f = av.Worker(ScreenSource())
+    f._tracker = BoardTracker(first_side="w")
+    f.auto_side_pending = True
+    f._apply_my_side("w", "红方底线在画面下方", fen_to_rows(START_BOARD))
+    check("自动判断后 auto_side_pending 由调用方清掉（此处仍为真）",
+          f.auto_side_pending is True)
+    check("自动判断写入 my_side", f.my_side == "w", f.my_side)
+
+    # ---- 3e. 自动走棋的轮次硬闸门 ----
+    print("\n③e 自动走棋轮次闸门（_turn_guard_blocks）")
     g = av.Worker(ScreenSource())
     g._tracker = BoardTracker(first_side="b")
     g.my_side = "b"
@@ -153,13 +213,13 @@ def main() -> int:
     check("轮次是红方时不拦（本来就轮不到我方）",
           g._turn_guard_blocks() is False)
     g._cur_side = "b"
-    g._cur_fen_base = "rnbakab1r/9/1c4nc1/p1p1p1p1p/9/9/P1P1P1P1P/1C2C4/9/RNBAKABNR"
+    g._cur_fen_base = MID_BOARD
     check("中盘接手（非初始盘面）不拦", g._turn_guard_blocks() is False)
     g._tracker = None
     check("tracker 为空时不拦", g._turn_guard_blocks() is False)
 
-    # ---- 3c. safe_slot 实参裁剪（Qt 信号会把实参全量传进槽）----
-    print("\n③c safe_slot（异常可见化 + 实参裁剪）")
+    # ---- 3f. safe_slot 实参裁剪（Qt 信号会把实参全量传进槽）----
+    print("\n③f safe_slot（异常可见化 + 实参裁剪）")
     from app_vision import safe_slot
 
     calls = []
@@ -192,12 +252,29 @@ def main() -> int:
           tt.zero_arg.__name__)
     check("异常被吞掉并返回 None（不向上抛）", tt.boom() is None)
 
-    # ---- 4. 下拉框元组解包（「框选没反应」的根因）----
-    print("\n④ 窗口下拉框解包（_current_window）")
+    # ---- 4. 界面：新局已移除 + 下拉框元组解包 ----
+    print("\n④ 界面（新局已移除 / _current_window）")
     w = av.MainWindow()
     check("先手下拉已移除", not hasattr(w, "combo_side"))
-    check("新局按钮存在", w.btn_newgame.text() == "新局", w.btn_newgame.text())
+    check("「新局」按钮已移除", not hasattr(w, "btn_newgame"))
+    check("「新局」的武装标志已移除", not hasattr(w, "_newgame_armed"))
+    check("「新局」的槽函数已移除", not hasattr(w, "_on_new_game"))
     check("开始按钮已改名「分析」", w.btn_run.text() == "分析", w.btn_run.text())
+    check("我方执子下拉框保留（手动覆盖用）",
+          w.combo_my_side.currentData() in ("w", "b"),
+          w.combo_my_side.currentText())
+    check("我方执子下拉框可用（运行中也要能改）", w.combo_my_side.isEnabled())
+    check("默认没有手动改过执子", w._my_side_manual is False)
+    w.combo_my_side.setCurrentIndex(w.combo_my_side.findData("b"))
+    check("手动改下拉框 → 记下「本次分析不再自动判断」",
+          w._my_side_manual is True)
+    check("停止态手动改不会崩（worker 为 None）", w.worker is None)
+    w.on_done()
+    check("一次分析结束 → 标记复位（下次点分析重新自动判断）",
+          w._my_side_manual is False)
+    check("on_done 状态栏提示「已停止」",
+          "已停止" in w.statusBar().currentMessage(),
+          w.statusBar().currentMessage())
 
     # 模拟 refresh_windows 的存法：itemData 是 (hwnd, title) 元组
     w.combo.clear()
@@ -210,19 +287,23 @@ def main() -> int:
     w.combo.addItem("（未找到可用窗口）", None)
     check("无选中项时返回 None", w._current_window() is None)
 
-    # ---- 5. 新局按钮行为 ----
-    print("\n⑤ 新局 / 执子回填")
+    # ---- 5. 自动判断结果回填下拉框 ----
+    print("\n⑤ 自动判断 → 回填下拉框")
     w2 = av.MainWindow()
-    w2._on_new_game()
-    check("停止态点新局 → 记下待武装", w2._newgame_armed is True)
     check("接盘功能已彻底移除", not hasattr(w2, "_build_restart_panel")
           and not hasattr(w2, "chk_restart"))
     w2.on_side_detected({"side": "b", "why": "黑方底线在画面下方"})
     check("回填下拉框为「我方执黑」",
           w2.combo_my_side.currentData() == "b", w2.combo_my_side.currentText())
+    check("状态栏提示已自动判断",
+          "自动判断" in w2.statusBar().currentMessage(),
+          w2.statusBar().currentMessage())
     w2.on_side_detected({"side": "x", "why": "非法值"})
     check("非法 side 不改变下拉框",
           w2.combo_my_side.currentData() == "b", w2.combo_my_side.currentText())
+    w2.on_side_detected({"side": "w", "why": "红方底线在画面下方"})
+    check("再次判断可改回「我方执红」",
+          w2.combo_my_side.currentData() == "w", w2.combo_my_side.currentText())
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 0 if FAIL == 0 else 1
