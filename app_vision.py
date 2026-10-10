@@ -208,7 +208,7 @@ class Worker(QObject):
     book_state = Signal(dict)
     # 识别稳定（动画抑制）状态变化 {suppress, settling, ratio}
     settle_state = Signal(dict)
-    # 「新局」自动判断出的我方执子 {side, why}
+    # 点「分析」时自动判断出的我方执子 {side, why}
     side_detected = Signal(dict)
 
     def __init__(self, source: ScreenSource) -> None:
@@ -298,7 +298,7 @@ class Worker(QObject):
         # 天天象棋吃子时棋盘中间会弹「吃」字动画，遮住盘面导致误识别。
         # 用帧间像素差异检测「画面正在变化」，变化期间一律不进入演化校验，
         # 直到画面静止达到 settle_ms 才恢复 —— 即「等动画消失后再识别」。
-        self.anim_suppress = False      # 动画抑制总开关（默认关）
+        self.anim_suppress = True       # 动画抑制总开关（默认开）
         self.settle_ms = 400            # 画面需静止这么久才恢复识别
         self.motion_thresh = 0.02       # 变化像素比例阈值（2%）
         # 最长抑制时长：超过就强制放行一帧，防止持续动画把识别永久卡死
@@ -307,7 +307,7 @@ class Worker(QObject):
         self._still_since = 0.0         # 画面开始静止的时刻
         self._settle_start = 0.0        # 本轮「画面在动」的起始时刻（超时兜底用）
         self._settling = False          # 是否正处于「等待稳定」状态
-        # ---- 「新局」自动判断我方执子 ----
+        # ---- 点「分析」时自动判断我方执子 ----
         self.auto_side_pending = False  # 待自动判断（棋盘一出现就判）
         self._side_note = ""            # 上次的失败原因（避免刷屏）
         # 主线程 → Worker 的参数变更命令队列。
@@ -409,7 +409,7 @@ class Worker(QObject):
         ratio = motion_ratio(prev, g)
         return ratio > self.motion_thresh, ratio
 
-    # ---- 「新局」自动判断我方执子 ----
+    # ---- 自动判断我方执子 ----
     @staticmethod
     def _detect_my_side(keypoints, img_shape=None) -> tuple[str | None, str]:
         """从棋盘朝向判断我方执子，返回 ``(side, 说明)``；判不了返回 ``(None, 原因)``。
@@ -449,6 +449,31 @@ class Worker(QObject):
         if a_y > j_y:
             return "b", f"黑方底线在画面下方（y {a_y:.0f} > {j_y:.0f}）"
         return "w", f"红方底线在画面下方（y {j_y:.0f} > {a_y:.0f}）"
+
+    def _apply_my_side(self, side: str, why: str = "", rows=None,
+                       auto: bool = True) -> None:
+        """定下我方执子，并在**还没采信任何局面**时一并定下「首帧轮次」。
+
+        首帧轮次只有这一次机会猜，规则：
+        * 盘面还是**初始局面** → 按规则「红先」（这时红方一定还没动子）；
+        * 否则（中盘接手）→ 默认「**轮到我方**」—— 你点「分析」多半就是因为
+          轮到你走。
+        猜错也不怕，两层兜底：``BoardTracker`` 观察到第一次走子会做「双方合法性
+        自纠」；自动走棋另有一道 :meth:`_turn_guard_blocks` 硬闸门。
+
+        只在 ``tracker.stable_fen is None``（尚未采信任何局面）时重置轮次 ——
+        一旦有局面，轮次已交给演化校验/自纠管理，不能在这里覆盖。
+        """
+        self.my_side = side
+        if self._tracker is not None and self._tracker.stable_fen is None:
+            board = self.rows_to_fen(rows, "w").split()[0] if rows else ""
+            self._tracker.side_to_move = "w" if board == START_BOARD else side
+        self._log(f"我方执子：{side}（{why or '手动指定'}）")
+        if auto:
+            try:
+                self.side_detected.emit({"side": side, "why": why})
+            except Exception:
+                pass
 
     @Slot()
     def run(self) -> None:
@@ -626,7 +651,7 @@ class Worker(QObject):
                         except Exception:
                             pass
 
-            # ---- 「新局」自动判断我方执子 ----
+            # ---- 点「分析」时自动判断我方执子 ----
             # 放在动画抑制之后：拿到的是一帧**稳定**画面，关键点更可信。
             # 开局红方还没动子 / 对局还在匹配中时也能判（只看棋盘朝向）。
             if self.auto_side_pending:
@@ -634,12 +659,7 @@ class Worker(QObject):
                 if _side:
                     self.auto_side_pending = False
                     self._side_note = ""
-                    self.my_side = _side
-                    self._log(f"自动判断我方执子：{_side}（{_why}）")
-                    try:
-                        self.side_detected.emit({"side": _side, "why": _why})
-                    except Exception:
-                        pass
+                    self._apply_my_side(_side, _why, rows)
                 elif _why != self._side_note:
                     self._side_note = _why
                     self.status.emit(
@@ -650,7 +670,16 @@ class Worker(QObject):
                 self._same += 1
             else:
                 self._last_key, self._same = key, 1
-            if self._same < self.confirm or key == self._published:
+            # ★ 两个条件必须**分开** —— 它们要的东西正好相反：
+            #   · `_same < confirm`：正在确认一个**新变化**。对手每走一步都会
+            #     重新触发这里，此刻最需要快；那 100ms 是纯加时（循环已被抓帧 +
+            #     推理自然限速，再 sleep 只是把反应时间往后推）。
+            #   · `key == _published`：局面**没变**的稳态轮询，这里才该节流。
+            #   原先两者共用一次 sleep(0.10)，confirm=3 时每手白等 200ms。
+            if self._same < self.confirm:
+                time.sleep(0.005)          # 只为让出 GIL，不再人为降速
+                continue
+            if key == self._published:
                 time.sleep(0.10)
                 continue
 
@@ -1103,7 +1132,7 @@ class Worker(QObject):
         """轮次**未经验证**时是否该拦住自动走棋。
 
         若 tracker 认为是**黑方**走、又还没观察到任何走子、且盘面还是**初始
-        局面** —— 这个轮次几乎必然是猜错的（象棋红先，新局第一手一定是红方）。
+        局面** —— 这个轮次几乎必然是猜错的（象棋红先，开局第一手一定是红方）。
         此时落子会走出不该走的着法，所以直接不点。
 
         为什么只挡「初始局面」：真·黑方先走的局面不存在；而中盘接手时盘面
@@ -1481,8 +1510,10 @@ class Worker(QObject):
             except Exception as exc:
                 self.error.emit(f"清空置换表失败: {exc}")
         if last_myside in ("w", "b"):
-            self.my_side = last_myside
-            self._log(f"我方执子改为：{last_myside}")
+            # 手动改「我方执子」= 用户明确表态 → 取消还没完成的自动判断，
+            # 否则几帧后自动判断又会把它改回去。
+            self.auto_side_pending = False
+            self._apply_my_side(last_myside, "手动指定", auto=False)
         if last_settle is not None:
             try:
                 self.apply_settle_params(last_settle)
@@ -1761,8 +1792,8 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         # 高级面板：控件引用 {name: (widget, type, default)}
         self.adv_controls: dict = {}
-        # 未开始分析时点了「新局」→ 记住，等 start() 时立刻自动判断
-        self._newgame_armed = False
+        # 用户是否手动改过「我方执子」→ 本次分析不再自动判断（见 start/on_done）
+        self._my_side_manual = False
         dpi = enable_dpi_awareness()
 
         # ---- 左：棋盘 ----
@@ -1869,7 +1900,7 @@ class MainWindow(QMainWindow):
         self.chk_infinite.toggled.connect(self._on_infinite_toggled)
 
         # 我方执子：决定「谁是我方」—— 影响左栏显示朝向、自动走棋「只走我方」
-        # 的闸门，以及胜率视角。默认由「新局」自动判断。
+        # 的闸门，以及胜率视角。默认由**点「分析」时自动判断**。
         # ★ 原来的「先手」下拉已移除：分析时默认按「轮到我方」处理，
         #   而且 BoardTracker 会在观察到第一次走子时自动纠正轮次（双方合法性自纠），
         #   所以开局猜错也能自愈。
@@ -1880,17 +1911,9 @@ class MainWindow(QMainWindow):
             "你在这局里执哪一方。\n"
             "识别模型会自动把棋盘摆正（谁在下都能正确识别），\n"
             "此项决定：左栏盘面朝向我方、自动走棋只走我方。\n"
-            "点「新局」会自动判断（象棋客户端都把己方摆在画面下方）。")
+            "点「分析」时会自动判断（象棋客户端都把己方摆在画面下方）；\n"
+            "判断不对可以随时手动改 —— 手动改过之后本次分析就不再自动判断。")
         self.combo_my_side.currentIndexChanged.connect(self._on_my_side_changed)
-
-        self.btn_newgame = QPushButton("新局")
-        self.btn_newgame.setMinimumWidth(64)
-        self.btn_newgame.setToolTip(
-            "开新一局：**停掉当前分析**并清空局面跟踪（避免上一局的局面/轮次\n"
-            "残留把新局挡下），然后由你点「分析」重新开始。\n"
-            "点「分析」时会**自动判断我方执子** —— 按「己方棋子摆在画面下方」\n"
-            "这个所有象棋客户端通用的约定，开局红方还没动子也能判。")
-        self.btn_newgame.clicked.connect(self._on_new_game)
 
         self.btn_run = QPushButton("分析")
         self.btn_run.setMinimumWidth(96)
@@ -1903,7 +1926,6 @@ class MainWindow(QMainWindow):
         top.addSpacing(10)
         top.addWidget(QLabel("我方执子"))
         top.addWidget(self.combo_my_side)
-        top.addWidget(self.btn_newgame)
         top.addSpacing(6)
         top.addWidget(QLabel("思考"))
         top.addWidget(self.spin_mt)
@@ -2125,7 +2147,7 @@ class MainWindow(QMainWindow):
 
     # ---------------- 识别稳定（动画抑制）面板 ----------------
     def _build_settle_panel(self) -> QGroupBox:
-        """构建「识别稳定」面板（默认折叠、**功能默认关闭**）。
+        """构建「识别稳定」面板（默认展开、**功能默认开启**）。
 
         天天象棋吃子时棋盘中间会弹「吃」字动画，遮住盘面导致识别出错。
         开启后：检测到画面正在变化就暂停识别，直到画面静止达到设定时长才
@@ -2133,7 +2155,7 @@ class MainWindow(QMainWindow):
         """
         grp = QGroupBox("识别稳定（动画抑制）")
         grp.setCheckable(True)
-        grp.setChecked(False)
+        grp.setChecked(True)
 
         outer = QVBoxLayout(grp)
         outer.setContentsMargins(6, 6, 6, 6)
@@ -2148,7 +2170,7 @@ class MainWindow(QMainWindow):
         grid.setContentsMargins(0, 0, 0, 0)
 
         self.chk_anim = QCheckBox("等画面静止后再识别")
-        self.chk_anim.setChecked(False)
+        self.chk_anim.setChecked(True)
         self.chk_anim.setToolTip(
             "开启后：帧间像素差异超过阈值即视为「画面在动」（吃子动画、\n"
             "落子动画、窗口刷新等），暂停识别；画面静止达到设定时长才恢复。\n"
@@ -2179,7 +2201,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.spin_thresh, 2, 1)
         outer.addWidget(body)
 
-        body.setVisible(False)
+        body.setVisible(True)              # 面板默认展开（功能默认开启）
         grp.toggled.connect(body.setVisible)
 
         self.chk_anim.toggled.connect(self._on_settle_changed)
@@ -2230,23 +2252,15 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    # ---------------- 新局 / 我方执子 ----------------
-    @safe_slot
-    def _on_new_game(self) -> None:
-        """开新局：停掉当前分析 + 准备自动判断我方执子，然后**由你点「分析」开始**。
-
-        刻意不自动开始分析：新局是一个「准备」动作，什么时候开始由你决定。
-        点「分析」后 Worker 会用全新的局面跟踪起步，并立刻自动判断我方执子。
-        """
-        self._newgame_armed = True
-        if self.worker is not None:
-            self.stop()          # on_done 里会提示「已开新局，点分析开始」
-        else:
-            self.statusBar().showMessage(
-                "已开新局 —— 点「分析」开始（会自动判断我方执子）")
-
+    # ---------------- 我方执子 ----------------
     def _on_my_side_changed(self, *_args) -> None:
-        """手动改「我方执子」→ 立刻同步给正在跑的 Worker（走命令队列）。"""
+        """手动改「我方执子」→ 立刻同步给正在跑的 Worker（走命令队列）。
+
+        手动选择 = 用户明确表态，**本次分析**不再自动判断（Worker 收到后会取消
+        还没完成的自动判断）；下一次点「分析」会重新自动判断（见 on_done）。
+        注意 ``on_side_detected`` 回填下拉框时用了 ``blockSignals``，不会走到这里。
+        """
+        self._my_side_manual = True
         side = self.combo_my_side.currentData() or "w"
         if self.worker is not None:
             self.worker.post_my_side(side)
@@ -2824,18 +2838,16 @@ class MainWindow(QMainWindow):
         self.worker.movetime = self.spin_mt.value()
         self.worker.confirm = self.spin_conf.value()
         self.worker.my_side = self.combo_my_side.currentData() or "w"
-        # 轮次（原「先手」下拉已删除）：
-        #   * 点过「新局」→ 按**规则**用「红方先手」（新局时红方还没动子）；
-        #   * 直接点「分析」→ 默认按「轮到我方」。
+        # 轮次（原「先手」下拉已删除）：默认按「轮到我方」处理；若首帧盘面还是
+        # **初始局面**，Worker 会改用规则上的「红方先手」（见 Worker._apply_my_side）。
         # 猜错也不怕，有两层兜底：
         #   ① BoardTracker 观察到第一次走子时会做「双方合法性自纠」；
         #   ② 自动走棋另有一道硬闸门，挡掉「盘面还是开局却认为轮到黑方」的情形。
-        self.worker.first_side = ("w" if self._newgame_armed
-                                  else (self.combo_my_side.currentData() or "w"))
-        if self._newgame_armed:
-            # 停止状态下点过「新局」→ 一开始分析就立刻自动判断执子
-            self.worker.auto_side_pending = True
-            self._newgame_armed = False
+        self.worker.first_side = self.worker.my_side
+        # ★ 点「分析」就自动判断我方执子：棋盘一出现就判（只看棋盘朝向，
+        #   跟「红先」无关，所以开局红方还没动子也能判）。
+        #   若你已手动改过下拉框（启动前或运行中），本次分析就听你的，不自动判断。
+        self.worker.auto_side_pending = not self._my_side_manual
         # 引擎参数（可调）
         params = self._collect_engine_params()
         self.worker.threads = params["threads"]
@@ -2881,7 +2893,8 @@ class MainWindow(QMainWindow):
         self._update_auto_indicator(self._auto_mode() != "off")
         self.btn_run.setText("停止")
         self.combo.setEnabled(False)
-        self.combo_my_side.setEnabled(False)
+        # ★ 「我方执子」**不**禁用：自动判断可能不准，运行中也要能随时手动改
+        #   （改动经 post_my_side 走命令队列，Worker 立即生效）。
 
     def stop(self) -> None:
         if self.worker:
@@ -2932,13 +2945,10 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.btn_run.setText("分析")
         self.combo.setEnabled(True)
-        self.combo_my_side.setEnabled(True)
         self._update_auto_indicator(False)
-        if self._newgame_armed:
-            self.statusBar().showMessage(
-                "已开新局 —— 点「分析」开始（会自动判断我方执子）")
-        else:
-            self.statusBar().showMessage("已停止")
+        # 一次分析结束 → 清掉「手动改过」标记：下次点「分析」重新自动判断
+        self._my_side_manual = False
+        self.statusBar().showMessage("已停止")
 
     def closeEvent(self, ev) -> None:
         self._save_auto_config()

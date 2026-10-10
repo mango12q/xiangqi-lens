@@ -50,7 +50,52 @@ DST_SIZE = (450, 500)   # 透视后棋盘尺寸 (w, h)，500/450 ≈ 10 行 9 �
 PADDING = 50
 
 
-def make_session(path: str, prefer_cuda: bool = True) -> ort.InferenceSession:
+def assert_input_shape(sess, batch: int, height: int, width: int, tag: str) -> None:
+    """校验会话声明的输入形状已被钉成 ``(batch, 3, height, width)``。
+
+    钉死动态维度是**性能关键**（见 :func:`make_session`），但覆盖值必须与实际
+    喂入尺寸**严格相等**。不相等时 onnxruntime 会抛 ``InvalidArgument``（不会
+    静默算错），所以这里在**构造期**就把不匹配暴露出来，而不是等第一帧。
+    """
+    try:
+        shape = list(sess.get_inputs()[0].shape)
+    except Exception as exc:                       # pragma: no cover - 防御
+        raise RuntimeError(f"{tag}: 无法读取输入形状: {exc}") from exc
+    want = [batch, 3, height, width]
+    if shape != want:
+        raise RuntimeError(
+            f"{tag}: 输入形状 {shape} 与钉死的 {want} 不一致 —— "
+            f"检查 make_session 的 fixed_dims 是否与 predict 的喂入尺寸相符")
+
+
+def make_session(path: str, prefer_cuda: bool = True,
+                 fixed_dims: dict | None = None) -> ort.InferenceSession:
+    """创建推理会话。
+
+    ★ ``fixed_dims`` 用来**钉死模型的动态输入维度**，这是本管线最大的一笔性能改动。
+
+    两个模型的输入声明里都带动态轴（pose 是 ``['batch',3,256,256]``，cls 是
+    ``['batch',3,'height','width']``），而本管线的喂入尺寸其实是**恒定**的：
+    pose 恒为 ``warpAffine`` 到 ``size``，cls 恒为 ``resize`` 到 ``input_size``。
+    带动态轴时 onnxruntime 的 DML provider 每帧走慢路径，实测：
+
+    ==================  ============  ==========  ======
+    模型                 动态维度       钉死后      加速
+    ==================  ============  ==========  ======
+    cls（90 格分类）      124.45 ms      5.09 ms    24.4x
+    pose（4 角点）          2.29 ms      1.03 ms     2.2x
+    ``infer`` 整体        121.6 ms       8.8 ms    13.2x
+    ==================  ============  ==========  ======
+
+    CPU 版同样受益（180.6 ms → 50.7 ms）。输出已验证**等价**：300 组合成输入 +
+    37 张真实截图的 argmax / ``rows`` 全一致，仅存 1e-6 量级浮点噪声
+    （kernel 归约顺序不同）。回归见 ``tools/test_session_equiv.py``。
+
+    ``fixed_dims`` 传 ``{轴名: 值}``；传 ``None`` 则保持模型原样（测试对照用）。
+    """
+    so = ort.SessionOptions()
+    for name, value in (fixed_dims or {}).items():
+        so.add_free_dimension_override_by_name(name, int(value))
     avail = ort.get_available_providers()
     providers = []
     if prefer_cuda and "CUDAExecutionProvider" in avail:
@@ -58,7 +103,7 @@ def make_session(path: str, prefer_cuda: bool = True) -> ort.InferenceSession:
     if "DmlExecutionProvider" in avail:
         providers.append("DmlExecutionProvider")
     providers.append("CPUExecutionProvider")
-    return ort.InferenceSession(path, providers=providers)
+    return ort.InferenceSession(path, so, providers=providers)
 
 
 # ---------------- pose: 4 个角点 ----------------
@@ -99,10 +144,14 @@ class Pose4Kpt:
     """输入整图(RGB) → 输出 4 个棋盘外角点（A0/A8/J0/J8）在原图中的像素坐标。"""
 
     def __init__(self, model_path, size=(256, 256), padding=1.25, prefer_cuda=True):
-        self.sess = make_session(model_path, prefer_cuda)
-        self.in_name = self.sess.get_inputs()[0].name
         self.size = size
         self.padding = padding
+        # ★ 钉死输入维度：predict 里恒为 warpAffine 到 self.size（见下），
+        #   带动态 batch 轴时 DML 每帧走慢路径（实测 2.29ms → 1.03ms）。
+        self.sess = make_session(model_path, prefer_cuda,
+                                 {"batch": 1, "height": size[1], "width": size[0]})
+        self.in_name = self.sess.get_inputs()[0].name
+        assert_input_shape(self.sess, 1, size[1], size[0], "pose")
 
     def predict(self, img_rgb: np.ndarray):
         h, w = img_rgb.shape[:2]
@@ -141,9 +190,14 @@ def extract_board(img_rgb: np.ndarray, kps: np.ndarray):
 # ---------------- 90 点分类 ----------------
 class BoardClassifier:
     def __init__(self, model_path, input_size=(280, 315), prefer_cuda=True):
-        self.sess = make_session(model_path, prefer_cuda)
-        self.in_name = self.sess.get_inputs()[0].name
         self.input_size = input_size  # (w, h)
+        # ★ 钉死输入维度：predict 里恒为 resize 到 self.input_size（见下）。
+        #   这是全链路最贵的一步，钉死后实测 124.45ms → 5.09ms（24.4x）。
+        self.sess = make_session(model_path, prefer_cuda,
+                                 {"batch": 1, "height": input_size[1],
+                                  "width": input_size[0]})
+        self.in_name = self.sess.get_inputs()[0].name
+        assert_input_shape(self.sess, 1, input_size[1], input_size[0], "cls")
 
     def predict(self, board_rgb: np.ndarray):
         img = cv2.resize(board_rgb, self.input_size)
