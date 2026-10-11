@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import struct
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -149,6 +151,52 @@ def main() -> int:
     c.check("build() 里删除 XiangQiLens.spec", "SPEC.unlink" in SRC)
     c.check("SPEC 指向仓库内的 spec 文件",
             build_exe.SPEC.parent == HERE, f"实得 {build_exe.SPEC}")
+
+    print()
+    print("[9] 发布 zip 的压缩策略按抽样实测，不按扩展名猜")
+    _zspec = importlib.util.spec_from_file_location(
+        "make_release_zip", str(HERE / "tools" / "make_release_zip.py"))
+    mr = importlib.util.module_from_spec(_zspec)
+    _zspec.loader.exec_module(mr)                # type: ignore[union-attr]
+    ZIP_SRC = (HERE / "tools" / "make_release_zip.py").read_text(encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+
+        dll = td / "fake.dll"
+        dll.write_bytes(b"xq-vision-dll-payload" * 40_000)
+        ctype, _lvl = mr.plan(dll)
+        c.check(".dll 压得动就必须压（旧策略当成「已压缩格式」原样存）",
+                ctype == zipfile.ZIP_DEFLATED, f"实得 compress_type={ctype}")
+
+        pyd = td / "fake.pyd"
+        pyd.write_bytes(b"onnxruntime-python-binding" * 30_000)
+        ctype, _lvl = mr.plan(pyd)
+        c.check(".pyd 压得动就必须压", ctype == zipfile.ZIP_DEFLATED,
+                f"实得 compress_type={ctype}")
+
+        nnue = td / "fake.nnue"
+        nnue.write_bytes(os.urandom(300_000))
+        ctype, _lvl = mr.plan(nnue)
+        c.check("真压不动的 .nnue 必须原样存（deflate 反而更大，zipfile 不自动回退）",
+                ctype == zipfile.ZIP_STORED, f"实得 compress_type={ctype}")
+
+        png = td / "fake.png"
+        png.write_bytes(os.urandom(300_000))
+        ctype, _lvl = mr.plan(png)
+        c.check("随机数据（已压缩格式）必须原样存", ctype == zipfile.ZIP_STORED,
+                f"实得 compress_type={ctype}")
+
+        py = td / "fake.py"
+        py.write_text("def f():\n    return 1\n" * 5_000, encoding="utf-8")
+        ctype, lvl = mr.plan(py)
+        c.check(".py 可压且用 level 9",
+                ctype == zipfile.ZIP_DEFLATED and lvl == 9,
+                f"实得 type={ctype} level={lvl}")
+
+    c.check("每个文件都过 plan() 决定压缩方式", "plan(p)" in ZIP_SRC)
+    c.check("抽样失败时不会静默全量 deflate（有 WORTH_RATIO 判据）",
+            "WORTH_RATIO" in ZIP_SRC and "ZIP_STORED" in ZIP_SRC)
 
     return c.done()
 

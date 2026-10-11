@@ -293,9 +293,10 @@ def smoke_test() -> bool:
 def make_zip() -> Path | None:
     """压缩成可发布的 zip。
 
-    ★ 只走 ``tools/make_release_zip.py`` 这一条实现：它按扩展名分级压缩
-      （已压过的 .onnx/.nnue 用 STORED，文本用 level 9），产物名带版本号，
-      符合发布惯例。原来这里还有一条 ``shutil.make_archive`` 的旁路，
+    ★ 只走 ``tools/make_release_zip.py`` 这一条实现：它对每个文件**抽样试压**
+      （512KB×3）再决定 deflate 还是原样存 —— 压不动的（.nnue 稠密权重）
+      原样存，压得动的（.dll/.pyd/.onnx）才压，产物名带版本号，符合发布惯例。
+      原来这里还有一条 ``shutil.make_archive`` 的旁路，
       产出无版本号的 ``dist/XiangQiLens.zip`` 且用默认压缩 —— 慢、体积大、
       名字还不对，发布时容易发错包。
     """
